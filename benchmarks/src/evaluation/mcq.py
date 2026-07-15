@@ -1,5 +1,6 @@
 import logging
 
+import pandas as pd
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -52,6 +53,7 @@ def evaluate_model(model, dataloader, args, tokenizer=None, is_synthetic=False):
 
     # Initialize the counter for the number of times each type is predicted
     predictions_by_type = {'positive': 0, 'negative': 0, 'hybrid': 0}
+    sample_results = []
 
     # Initialize a nested dictionary to map each question type to the number of times each wrong answer type is selected
     wrong_answers_by_question_type = {
@@ -61,7 +63,10 @@ def evaluate_model(model, dataloader, args, tokenizer=None, is_synthetic=False):
     }
 
     with torch.no_grad():
-        for image_tensor, captions, correct_answer, correct_answer_type in tqdm(dataloader, unit_scale=args.batch_size):
+        for image_tensor, captions, correct_answer, correct_answer_type, image_path in tqdm(
+            dataloader,
+            unit_scale=args.batch_size
+        ):
             batch_size, num_options = image_tensor.size(0), len(captions)
 
             image_tensor = image_tensor.to(device=args.device, dtype=input_dtype)
@@ -86,6 +91,40 @@ def evaluate_model(model, dataloader, args, tokenizer=None, is_synthetic=False):
             predicted_answer = torch.argmax(logits, dim=1)
             correct_predictions = (predicted_answer == correct_answer).sum().item()
             correct_answers_sum += correct_predictions
+
+            # [ADD] Save per-sample prediction information
+
+            logits_cpu = logits.detach().cpu()
+            predicted_cpu = predicted_answer.detach().cpu()
+            correct_cpu = correct_answer.detach().cpu()
+
+            for i in range(batch_size):
+
+                sample = {
+                    "image_path": image_path[i],
+
+                    "question_type": correct_answer_type[i],
+
+                    "correct_answer": int(correct_cpu[i]),
+
+                    "predicted_answer": int(predicted_cpu[i]),
+
+                    "is_correct": bool(
+                        predicted_cpu[i] == correct_cpu[i]
+                    ),
+                }
+
+                # Save captions
+                for j in range(num_options):
+                    sample[f"caption_{j}"] = captions[j][i]
+
+                # Save raw logits
+                for j in range(num_options):
+                    sample[f"logit_{j}"] = float(
+                        logits_cpu[i, j]
+                    )
+
+                sample_results.append(sample)
 
             # Update counts for each answer type and track predictions
             for i in range(batch_size):
@@ -126,7 +165,8 @@ def evaluate_model(model, dataloader, args, tokenizer=None, is_synthetic=False):
         'most_common_wrong_answer_type': wrong_answer_to_type[most_common_wrong_answer_type],
         'wrong_answer_percentages': wrong_answer_percentages,
         'predictions_by_type': predictions_by_type,
-        'wrong_answers_by_question_type': wrong_answers_by_question_type
+        'wrong_answers_by_question_type': wrong_answers_by_question_type,
+        'sample_results': sample_results,
     }
 
 def evaluate_binary_mcq_model(model, dataloader, args, tokenizer=None):
@@ -156,9 +196,10 @@ def evaluate_binary_mcq_model(model, dataloader, args, tokenizer=None):
     model.eval()
     total_questions = len(dataloader.dataset)
     correct_answers_sum = 0
+    sample_results = []
 
     with torch.no_grad():
-        for image_tensor, captions, correct_answer in tqdm(dataloader, unit_scale=args.batch_size):
+        for image_tensor, captions, correct_answer, image_path in tqdm(dataloader,unit_scale=args.batch_size):
             batch_size = image_tensor.size(0)
 
             # Move inputs to the appropriate device
@@ -191,12 +232,41 @@ def evaluate_binary_mcq_model(model, dataloader, args, tokenizer=None):
             correct_predictions = (predicted_answer == correct_answer).sum().item()
             correct_answers_sum += correct_predictions
 
+            # [ADD] Save per-sample prediction information
+
+            logits_cpu = logits.detach().cpu()
+            predicted_cpu = predicted_answer.detach().cpu()
+            correct_cpu = correct_answer.detach().cpu()
+
+            for i in range(batch_size):
+
+                sample = {
+                    "image_path": image_path[i],
+
+                    "correct_answer": int(correct_cpu[i]),
+
+                    "predicted_answer": int(predicted_cpu[i]),
+
+                    "is_correct": bool(
+                        predicted_cpu[i] == correct_cpu[i]
+                    ),
+
+                    "caption_0": captions[0][i],
+                    "caption_1": captions[1][i],
+
+                    "logit_0": float(logits_cpu[i, 0]),
+                    "logit_1": float(logits_cpu[i, 1]),
+                }
+
+                sample_results.append(sample)
+
     # Compute overall accuracy
     total_accuracy = correct_answers_sum / total_questions
 
     # Return the total accuracy
     return {
-        'total_accuracy': total_accuracy
+        "total_accuracy": total_accuracy,
+        "sample_results": sample_results,
     }
 
 
@@ -258,6 +328,7 @@ def mcq_eval(model, data, epoch, args, tokenizer=None):
             results['coco-mcq-wrong_answer_percentages'] = list(coco_mcq['wrong_answer_percentages'].items())
             results['coco-mcq-predictions_by_type'] = coco_mcq['predictions_by_type']
             results['coco-mcq-wrong_answers_by_question_type'] = coco_mcq['wrong_answers_by_question_type']
+            results["coco-mcq-sample_results"] = coco_mcq["sample_results"]
 
         if 'voc2007-mcq' in data:
             logging.info('Evaluating on the VOC2007 MCQ task')

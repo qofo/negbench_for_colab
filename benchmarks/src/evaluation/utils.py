@@ -5,6 +5,7 @@ import wandb
 from src.evaluation.mcq import mcq_eval
 from src.evaluation.retrieval import retrieval_eval
 import os
+import pandas as pd
 
 def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
     """
@@ -29,6 +30,27 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
     print("Evaluating MCQ")
     mcq_metrics = mcq_eval(model, data, epoch, args, tokenizer=tokenizer)
     metrics.update(mcq_metrics)
+
+    # [ADD] Save per-sample prediction results (COCO only)
+
+    if "coco-mcq-sample_results" in mcq_metrics:
+
+        prediction_dir = os.path.join(args.logs, args.name, "predictions")
+        os.makedirs(prediction_dir, exist_ok=True)
+
+        df = pd.DataFrame(mcq_metrics["coco-mcq-sample_results"])
+
+        csv_path = os.path.join(
+            prediction_dir,
+            "coco-mcq_predictions.csv"
+        )
+
+        df.to_csv(csv_path, index=False)
+
+        logging.info(f"Saved prediction CSV to {csv_path}")
+
+        # remove sample_results from metrics
+        metrics.pop("coco-mcq-sample_results", None)
 
     print("Evaluating Retrieval")
     retrieval_metrics = retrieval_eval(model, data, args, tokenizer=tokenizer)

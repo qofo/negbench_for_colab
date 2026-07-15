@@ -112,13 +112,19 @@ class CsvMCQDataset(Dataset):
         correct_answer = row["correct_answer"]
         correct_answer_template = row["correct_answer_template"]
 
-        images = self.transforms(Image.open(image_path))
+        image = self.transforms(Image.open(image_path))
 
         if self.tokenizer is not None:
             captions = [self.tokenizer([str(caption)])[0] for caption in captions]
             captions = torch.stack(captions) # (num_answers, max_seq_len)
 
-        return images, captions, correct_answer, correct_answer_template
+        return (
+            image,
+            captions,
+            correct_answer,
+            correct_answer_template,
+            image_path,
+        )
 
 class CsvBinaryMCQDataset(Dataset):
     def __init__(self, csv_file, transforms):
@@ -143,7 +149,12 @@ class CsvBinaryMCQDataset(Dataset):
 
         # Load and transform the image
         image = self.transforms(Image.open(image_path))
-        return image, captions, correct_answer
+        return (
+            image,
+            captions,
+            correct_answer,
+            image_path,
+        )
 
 class CsvImageCaptionDataset(Dataset):
     def __init__(self, csv_file, transforms, sep=',', img_key='filepath', caption_key='captions'):
