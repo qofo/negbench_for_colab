@@ -1,18 +1,18 @@
 #!/bin/bash
 
 # Set the base directory for data and logs. Users should update this to their directory structure.
-BASE_DIR="/content/negbench"  # Change this to your base directory
-DATA_DIR="/content/negbench/benchmarks/data"  # Change this to your data directory
+BASE_DIR="/path/to/your/research/project"  # Change this to your base directory
+DATA_DIR="path/to/your/data"  # Change this to your data directory
 LOGS_DIR="$BASE_DIR/logs"
-MODELS_DIR="/content/negbench/benchmarks/models"  # Change this to your models directory
+MODELS_DIR="path/to/your/models"  # Change this to your models directory
 
 # Model and pretrained options
 MODEL="ViT-B-32"
-#MODEL_NAME="NegCLIP"
-#PRETRAINED_MODEL="$MODELS_DIR/$MODEL_NAME/negclip.pt" # Change this to the real path of your model
+MODEL_NAME="NegCLIP"
+PRETRAINED_MODEL="$MODELS_DIR/$MODEL_NAME/name_of_your_model.pt" # Change this to the real path of your model
 # Note: for an openclip model, you can use the following:
-MODEL_NAME="ViT_B_32_openai"
-PRETRAINED_MODEL="openai"
+# MODEL_NAME="ViT_B_32_openai"
+# PRETRAINED_MODEL="openai"
 
 # Dataset paths for images
 COCO_MCQ="$DATA_DIR/images/COCO_val_mcq_llama3.1_rephrased.csv"
@@ -35,7 +35,7 @@ ulimit -S -n 100000
 RUN_LOGS_DIR="$LOGS_DIR/evaluation"
 mkdir -p "$RUN_LOGS_DIR"
 
-cd /content/negbench/benchmarks/
+cd ..
 
 # Image Evaluation
 echo "Starting Image Evaluation..."
@@ -52,8 +52,30 @@ CUDA_VISIBLE_DEVICES=0 python -m src.evaluation.eval_negation \
     --zeroshot-frequency 1 \
     --imagenet-val="$DATA_DIR/images/imagenet" \
     --coco-mcq=$COCO_MCQ \
+    --voc2007-mcq=$VOC_MCQ \
     --coco-retrieval=$COCO_RETRIEVAL \
     --coco-negated-retrieval=$COCO_NEGATED_RETRIEVAL \
+    --batch-size=64 \
+    --workers=8
+
+# Video Evaluation
+echo "Starting Video Evaluation..."
+# Note: you can add --report-to wandb to report to wandb
+CUDA_VISIBLE_DEVICES=0 python -m src.evaluation.eval_negation \
+    --model $MODEL \
+    --pretrained $PRETRAINED_MODEL \
+    --name "video_$MODEL_NAME" \
+    --logs=$RUN_LOGS_DIR \
+    --dataset-type csv \
+    --csv-separator=, \
+    --csv-img-key filepath \
+    --csv-caption-key caption \
+    --zeroshot-frequency 1 \
+    --imagenet-val="$DATA_DIR/images/imagenet" \
+    --msrvtt-retrieval=$MSRVTT_RETRIEVAL \
+    --msrvtt-negated-retrieval=$MSRVTT_NEGATED_RETRIEVAL \
+    --msrvtt-mcq=$MSRVTT_MCQ \
+    --video \
     --batch-size=64 \
     --workers=8
 
