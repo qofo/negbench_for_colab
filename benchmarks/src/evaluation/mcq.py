@@ -44,7 +44,7 @@ def evaluate_model(model, dataloader, args, tokenizer=None, is_synthetic=False):
     correct_answers_by_type = {'positive': 0, 'negative': 0, 'hybrid': 0}
     total_questions_by_type = {'positive': 0, 'negative': 0, 'hybrid': 0}
 
-    # Aggregate wrong-answer counts keyed by semantic type (not raw index).
+    # [ADD] Aggregate wrong-answer counts keyed by semantic type (not raw index).
     # This works regardless of whether options are shuffled or not.
     wrong_answer_counts_by_type = {'hybrid': 0, 'positive': 0, 'negative': 0}
 
@@ -61,12 +61,12 @@ def evaluate_model(model, dataloader, args, tokenizer=None, is_synthetic=False):
 
     with torch.no_grad():
         for batch in tqdm(dataloader, unit_scale=args.batch_size):
-            # Support both old (5-tuple) and new (6-tuple with caption_types) dataset format.
+            # [UPDATE] Support both old (5-tuple) and new (6-tuple with caption_types) dataset format.
             if len(batch) == 6:
                 image_tensor, captions, correct_answer, correct_answer_type, image_path, caption_types_batch = batch
             else:
                 image_tensor, captions, correct_answer, correct_answer_type, image_path = batch
-                # Reconstruct caption_types_batch in the same (num_options, batch_size) layout
+                # [ADD] Reconstruct caption_types_batch in the same (num_options, batch_size) layout
                 # that DataLoader's default_collate produces for the 6-tuple path.
                 # Synthetic datasets have a different canonical option order.
                 if is_synthetic:
@@ -108,7 +108,7 @@ def evaluate_model(model, dataloader, args, tokenizer=None, is_synthetic=False):
             predicted_cpu = predicted_answer.detach().cpu()
             correct_cpu = correct_answer.detach().cpu()
 
-            # caption_types_batch from DataLoader collation is a list of tuples,
+            # [ADD] caption_types_batch from DataLoader collation is a list of tuples,
             # one tuple per option slot containing one string per sample in the batch.
             # Transpose so we get one list-of-types per sample.
             # Shape after zip(*caption_types_batch): (batch_size, num_options)
@@ -151,7 +151,7 @@ def evaluate_model(model, dataloader, args, tokenizer=None, is_synthetic=False):
                 predicted_idx = predicted_answer[i].item()
                 correct_idx = correct_answer[i].item()
 
-                # Derive the semantic type of the predicted caption slot using
+                # [UPDATE] Derive the semantic type of the predicted caption slot using
                 # per-sample caption_types (works with or without shuffling).
                 sample_caption_types = list(per_sample_caption_types[i])
                 predicted_caption_type = sample_caption_types[predicted_idx]  # e.g. 'gt', 'hybrid', 'positive', 'negative'

@@ -489,6 +489,7 @@ def parse_args(args):
     parser.add_argument(
         "--seed", type=int, default=0, help="Default random seed."
     )
+    # [ADD] Flag to shuffle MCQ options for generative model evaluation
     parser.add_argument(
         "--shuffle-mcq-options",
         default=False,
