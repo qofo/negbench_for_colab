@@ -1,6 +1,6 @@
 """
 LLaVA Modular Evaluator
-=======================
+
 Loads a locally stored LLaVA checkpoint and exposes each sub-module
 separately so that the vision encoder can be replaced with:
   - the original SigLIP/CLIP that shipped with LLaVA
@@ -8,13 +8,13 @@ separately so that the vision encoder can be replaced with:
   - any OpenCLIP-compatible model
 
 Supported LLaVA variants
--------------------------
+
 - LLaVA-1.5  (llava-hf/llava-1.5-*)
 - LLaVA-NeXT (llava-hf/llava-v1.6-*)
 - Any model that follows the `LlavaForConditionalGeneration` HuggingFace API.
 
 Usage
------
+
 See `eval_negation_llava.py` for the full evaluation pipeline, or use
 this class directly:
 
@@ -30,6 +30,7 @@ this class directly:
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -41,9 +42,31 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
+# Auto-detect LLaVA variant (1.5 vs NeXT)
+
+def _detect_llava_variant(model_path: str) -> str:
+    """
+    Reads the model_type field from model_path/config.json
+    and returns the LLaVA variant.
+
+    Returns:
+        "llava_next" for LLaVA-NeXT (llava-v1.6-*)
+        "llava" for LLaVA-1.5 (default, also used if detection fails)
+    """
+    config_file = Path(model_path) / "config.json"
+    if config_file.exists():
+        try:
+            with open(config_file, encoding="utf-8") as f:
+                cfg = json.load(f)
+            model_type = cfg.get("model_type", "")
+            if "llava_next" in model_type:
+                return "llava_next"
+        except Exception:
+            pass
+    return "llava"
+
+
 # Helper: load an OpenCLIP-compatible vision encoder from a checkpoint
-# ---------------------------------------------------------------------------
 
 def _load_openclip_vision_encoder(
     model_name: str,
@@ -73,16 +96,14 @@ def _load_openclip_vision_encoder(
     return model.visual, preprocess_val
 
 
-# ---------------------------------------------------------------------------
 # Main class
-# ---------------------------------------------------------------------------
 
 class LLaVAModularEvaluator:
     """
     Modular LLaVA evaluator with optional vision-encoder hot-swap.
 
     Architecture breakdown
-    ----------------------
+
     self.vision_tower    : nn.Module  -- encodes images -> patch feature grid
     self.mm_projector    : nn.Module  -- projects vision features -> LLM input space
     self.language_model  : nn.Module  -- causal LLM (Vicuna, Mistral, ...)
@@ -127,9 +148,9 @@ class LLaVAModularEvaluator:
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
 
-        # ------------------------------------------------------------------
         # 1. Load the full LLaVA model via HuggingFace transformers
-        # ------------------------------------------------------------------
+        # Auto-detects and loads either LLaVA-1.5 or LLaVA-NeXT
+
         logger.info(f"Loading LLaVA from {model_path} ...")
         try:
             from transformers import LlavaForConditionalGeneration, LlavaProcessor
@@ -139,30 +160,63 @@ class LLaVAModularEvaluator:
                 "Install with: pip install transformers>=4.36"
             ) from exc
 
-        self.processor = LlavaProcessor.from_pretrained(model_path)
-        self._full_model = LlavaForConditionalGeneration.from_pretrained(
-            model_path,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-        ).to(self.device)
+        # LLaVA-NeXT support (optional import, falls back to 1.5 if missing)
+        try:
+            from transformers import (
+                LlavaNextForConditionalGeneration,
+                LlavaNextProcessor,
+            )
+            _have_llava_next = True
+        except ImportError:
+            _have_llava_next = False
+
+        variant = _detect_llava_variant(model_path)
+        logger.info(f"  Detected variant : {variant}")
+
+        if variant == "llava_next" and _have_llava_next:
+            logger.info("  Using LlavaNextForConditionalGeneration")
+            self.processor = LlavaNextProcessor.from_pretrained(model_path)
+            self._full_model = LlavaNextForConditionalGeneration.from_pretrained(
+                model_path,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+            ).to(self.device)
+        else:
+            if variant == "llava_next" and not _have_llava_next:
+                logger.warning(
+                    "LlavaNextForConditionalGeneration not found "
+                    "(transformers version might be too old). "
+                    "Falling back to LlavaForConditionalGeneration."
+                )
+            logger.info("  Using LlavaForConditionalGeneration")
+            self.processor = LlavaProcessor.from_pretrained(model_path)
+            self._full_model = LlavaForConditionalGeneration.from_pretrained(
+                model_path,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+            ).to(self.device)
+
         self._full_model.eval()
 
-        # ------------------------------------------------------------------
         # 2. Expose sub-modules as named attributes
-        # ------------------------------------------------------------------
-        self.vision_tower: torch.nn.Module = self._full_model.vision_tower
-        self.mm_projector: torch.nn.Module = self._full_model.multi_modal_projector
-        self.language_model: torch.nn.Module = self._full_model.language_model
-
-        logger.info(
-            f"  vision_tower  : {type(self.vision_tower).__name__}\n"
-            f"  mm_projector  : {type(self.mm_projector).__name__}\n"
-            f"  language_model: {type(self.language_model).__name__}"
+        # Safely accesses attributes since LLaVA-1.5 and NeXT use the same names
+        self.vision_tower: torch.nn.Module = getattr(
+            self._full_model, "vision_tower", None
+        )
+        self.mm_projector: torch.nn.Module = getattr(
+            self._full_model, "multi_modal_projector", None
+        )
+        self.language_model: torch.nn.Module = getattr(
+            self._full_model, "language_model", None
         )
 
-        # ------------------------------------------------------------------
+        logger.info(
+            f"  vision_tower  : {type(self.vision_tower).__name__ if self.vision_tower else 'N/A'}\n"
+            f"  mm_projector  : {type(self.mm_projector).__name__ if self.mm_projector else 'N/A'}\n"
+            f"  language_model: {type(self.language_model).__name__ if self.language_model else 'N/A'}"
+        )
+
         # 3. Optionally swap the vision tower
-        # ------------------------------------------------------------------
         self._external_preprocess = None  # set when swapping encoder
 
         if vision_encoder_path is not None:
@@ -173,9 +227,7 @@ class LLaVAModularEvaluator:
                 )
             self._swap_vision_encoder(vision_encoder_model, vision_encoder_path)
 
-    # ------------------------------------------------------------------
     # Vision encoder hot-swap
-    # ------------------------------------------------------------------
 
     def _swap_vision_encoder(self, model_name: str, pretrained: str) -> None:
         """
@@ -218,9 +270,7 @@ class LLaVAModularEvaluator:
         self._external_preprocess = preprocess
         logger.info("Vision tower swap complete.")
 
-    # ------------------------------------------------------------------
     # MCQ answer generation
-    # ------------------------------------------------------------------
 
     def generate_mcq_answer(
         self,
@@ -269,9 +319,16 @@ class LLaVAModularEvaluator:
                 ],
             }
         ]
-        text_prompt = self.processor.apply_chat_template(
-            conversation, add_generation_prompt=True
-        )
+        # apply_chat_template was added to ProcessorMixin in transformers >= 4.40
+        # For older versions, it must be called via processor.tokenizer
+        if hasattr(self.processor, "apply_chat_template"):
+            text_prompt = self.processor.apply_chat_template(
+                conversation, add_generation_prompt=True
+            )
+        else:
+            text_prompt = self.processor.tokenizer.apply_chat_template(
+                conversation, add_generation_prompt=True, tokenize=False
+            )
 
         # Tokenize
         inputs = self.processor(
@@ -323,9 +380,7 @@ class LLaVAModularEvaluator:
         )
         return 0
 
-    # ------------------------------------------------------------------
     # Convenience: encode image only (for embedding-style analysis)
-    # ------------------------------------------------------------------
 
     def encode_image(self, image_tensor: torch.Tensor) -> torch.Tensor:
         """
@@ -337,7 +392,15 @@ class LLaVAModularEvaluator:
 
         Returns:
             (B, D) L2-normalised feature vectors.
+
+        Raises:
+            RuntimeError: If vision_tower is not found.
         """
+        if self.vision_tower is None:
+            raise RuntimeError(
+                "vision_tower attribute is missing. "
+                "This model might not support encode_image()."
+            )
         with torch.no_grad():
             feats = self.vision_tower(image_tensor)
             # Different vision towers expose features differently
