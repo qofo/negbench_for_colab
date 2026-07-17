@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from open_clip import get_input_dtype, get_tokenizer
+from training.data import CsvMCQDataset
 
 def evaluate_model(model, dataloader, args, tokenizer=None, is_synthetic=False):
     """
@@ -43,13 +44,9 @@ def evaluate_model(model, dataloader, args, tokenizer=None, is_synthetic=False):
     correct_answers_by_type = {'positive': 0, 'negative': 0, 'hybrid': 0}
     total_questions_by_type = {'positive': 0, 'negative': 0, 'hybrid': 0}
 
-    # Map prediction incorrect answer indices to answer types
-    if is_synthetic:
-        wrong_answer_to_type = {0: 'positive', 1: 'hybrid', 2: 'hybrid', 3: 'negative'}
-    else:
-        wrong_answer_to_type = {1: 'hybrid', 2: 'positive', 3: 'negative'}
-
-    wrong_answer_counts = {k: 0 for k in wrong_answer_to_type.keys()}
+    # [ADD] Aggregate wrong-answer counts keyed by semantic type (not raw index).
+    # This works regardless of whether options are shuffled or not.
+    wrong_answer_counts_by_type = {'hybrid': 0, 'positive': 0, 'negative': 0}
 
     # Initialize the counter for the number of times each type is predicted
     predictions_by_type = {'positive': 0, 'negative': 0, 'hybrid': 0}
@@ -63,10 +60,23 @@ def evaluate_model(model, dataloader, args, tokenizer=None, is_synthetic=False):
     }
 
     with torch.no_grad():
-        for image_tensor, captions, correct_answer, correct_answer_type, image_path in tqdm(
-            dataloader,
-            unit_scale=args.batch_size
-        ):
+        for batch in tqdm(dataloader, unit_scale=args.batch_size):
+            # [UPDATE] Support both old (5-tuple) and new (6-tuple with caption_types) dataset format.
+            if len(batch) == 6:
+                image_tensor, captions, correct_answer, correct_answer_type, image_path, caption_types_batch = batch
+            else:
+                image_tensor, captions, correct_answer, correct_answer_type, image_path = batch
+                # [ADD] Reconstruct caption_types_batch in the same (num_options, batch_size) layout
+                # that DataLoader's default_collate produces for the 6-tuple path.
+                # Synthetic datasets have a different canonical option order.
+                if is_synthetic:
+                    canonical = ['positive', 'hybrid', 'hybrid', 'negative']
+                else:
+                    canonical = list(CsvMCQDataset.CAPTION_TYPES)  # ['gt','hybrid','positive','negative']
+                batch_size_local = image_tensor.size(0)
+                # Shape: (num_options, batch_size) — one list of B identical strings per slot
+                caption_types_batch = [[t] * batch_size_local for t in canonical]
+
             batch_size, num_options = image_tensor.size(0), len(captions)
 
             image_tensor = image_tensor.to(device=args.device, dtype=input_dtype)
@@ -92,13 +102,21 @@ def evaluate_model(model, dataloader, args, tokenizer=None, is_synthetic=False):
             correct_predictions = (predicted_answer == correct_answer).sum().item()
             correct_answers_sum += correct_predictions
 
-            # [ADD] Save per-sample prediction information
+            # [ADD] Save per-sample prediction results (COCO only)
 
             logits_cpu = logits.detach().cpu()
             predicted_cpu = predicted_answer.detach().cpu()
             correct_cpu = correct_answer.detach().cpu()
 
+            # [ADD] caption_types_batch from DataLoader collation is a list of tuples,
+            # one tuple per option slot containing one string per sample in the batch.
+            # Transpose so we get one list-of-types per sample.
+            # Shape after zip(*caption_types_batch): (batch_size, num_options)
+            per_sample_caption_types = list(zip(*caption_types_batch))
+
             for i in range(batch_size):
+
+                sample_caption_types = list(per_sample_caption_types[i])  # e.g. ['hybrid', 'gt', 'negative', 'positive']
 
                 sample = {
                     "image_path": image_path[i],
@@ -130,14 +148,25 @@ def evaluate_model(model, dataloader, args, tokenizer=None, is_synthetic=False):
             for i in range(batch_size):
                 answer_type = correct_answer_type[i]
                 total_questions_by_type[answer_type] += 1
-                if predicted_answer[i] == correct_answer[i]:
+                predicted_idx = predicted_answer[i].item()
+                correct_idx = correct_answer[i].item()
+
+                # [UPDATE] Derive the semantic type of the predicted caption slot using
+                # per-sample caption_types (works with or without shuffling).
+                sample_caption_types = list(per_sample_caption_types[i])
+                predicted_caption_type = sample_caption_types[predicted_idx]  # e.g. 'gt', 'hybrid', 'positive', 'negative'
+
+                if predicted_idx == correct_idx:
                     correct_answers_by_type[answer_type] += 1
                     predictions_by_type[answer_type] += 1
                 else:
-                    wrong_answer_type = wrong_answer_to_type[predicted_answer[i].item()]
-                    wrong_answer_counts[predicted_answer[i].item()] += 1
-                    predictions_by_type[wrong_answer_type] += 1
-                    wrong_answers_by_question_type[answer_type][wrong_answer_type] += 1
+                    # predicted_caption_type is one of 'hybrid', 'positive', 'negative'
+                    # ('gt' only appears when the prediction is correct, so it won't show here)
+                    wrong_type = predicted_caption_type
+                    wrong_answer_counts_by_type[wrong_type] = wrong_answer_counts_by_type.get(wrong_type, 0) + 1
+                    predictions_by_type[wrong_type] = predictions_by_type.get(wrong_type, 0) + 1
+                    wrong_answers_by_question_type[answer_type][wrong_type] = \
+                        wrong_answers_by_question_type[answer_type].get(wrong_type, 0) + 1
 
     # Compute overall accuracy
     total_accuracy = correct_answers_sum / total_questions
@@ -148,13 +177,15 @@ def evaluate_model(model, dataloader, args, tokenizer=None, is_synthetic=False):
     negative_accuracy = correct_answers_by_type['negative'] / total_questions_by_type['negative'] if total_questions_by_type['negative'] > 0 else float('nan')
     hybrid_accuracy = correct_answers_by_type['hybrid'] / total_questions_by_type['hybrid'] if total_questions_by_type['hybrid'] > 0 else float('nan')
 
-
     # Compute the most common wrong answer type
-    most_common_wrong_answer_type = max(wrong_answer_counts, key=wrong_answer_counts.get)
+    most_common_wrong_answer_type = max(wrong_answer_counts_by_type, key=wrong_answer_counts_by_type.get)
 
     # Compute total number of wrong answers and the percentage of each error type
-    total_wrong_answers = sum(wrong_answer_counts.values())
-    wrong_answer_percentages = {wrong_answer_to_type[k]: (v / total_wrong_answers) * 100 for k, v in wrong_answer_counts.items()}
+    total_wrong_answers = sum(wrong_answer_counts_by_type.values())
+    wrong_answer_percentages = {
+        k: (v / total_wrong_answers) * 100 if total_wrong_answers > 0 else 0.0
+        for k, v in wrong_answer_counts_by_type.items()
+    }
 
     # Return a dictionary with all computed metrics
     return {
@@ -162,12 +193,13 @@ def evaluate_model(model, dataloader, args, tokenizer=None, is_synthetic=False):
         'positive_accuracy': positive_accuracy,
         'negative_accuracy': negative_accuracy,
         'hybrid_accuracy': hybrid_accuracy,
-        'most_common_wrong_answer_type': wrong_answer_to_type[most_common_wrong_answer_type],
+        'most_common_wrong_answer_type': most_common_wrong_answer_type,
         'wrong_answer_percentages': wrong_answer_percentages,
         'predictions_by_type': predictions_by_type,
         'wrong_answers_by_question_type': wrong_answers_by_question_type,
         'sample_results': sample_results,
     }
+
 
 def evaluate_binary_mcq_model(model, dataloader, args, tokenizer=None):
     """

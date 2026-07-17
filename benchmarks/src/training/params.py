@@ -489,6 +489,18 @@ def parse_args(args):
     parser.add_argument(
         "--seed", type=int, default=0, help="Default random seed."
     )
+    # [ADD] Flag to shuffle MCQ options for generative model evaluation
+    parser.add_argument(
+        "--shuffle-mcq-options",
+        default=False,
+        action="store_true",
+        help=(
+            "Shuffle the order of MCQ answer choices at evaluation time. "
+            "Uses --seed for reproducibility. "
+            "Has no effect on CLIP-like embedding models (correct by design), "
+            "but is essential for generative models (e.g., LLaVA) to remove position bias."
+        ),
+    )
     parser.add_argument(
         "--grad-clip-norm", type=float, default=None, help="Gradient clip."
     )

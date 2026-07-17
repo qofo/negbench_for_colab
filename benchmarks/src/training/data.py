@@ -84,9 +84,15 @@ class CsvCLassDataset(Dataset):
         return images, labels
 
 class CsvMCQDataset(Dataset):
-    def __init__(self, csv_file, transforms, num_answers=4, path="image_path", tokenizer=None):
+    # Canonical caption order as stored in the CSV files.
+    # caption_0 is always the correct answer; captions 1-3 are distractors.
+    CAPTION_TYPES = ['gt', 'hybrid', 'positive', 'negative']
+    SYNTHETIC_CAPTION_TYPES = ['positive', 'hybrid', 'hybrid', 'negative']
+
+    def __init__(self, csv_file, transforms, num_answers=4, path="image_path",
+                 tokenizer=None, shuffle_options=False, seed=42, is_synthetic=False):
         """
-        Dataset for MCQ task evaluation
+        Dataset for MCQ task evaluation.
 
         Args:
             csv_file (string): Path to the csv file with annotations.
@@ -95,12 +101,23 @@ class CsvMCQDataset(Dataset):
             path (string): Column name for image file paths.
             tokenizer (callable): Tokenizer to be applied on the captions.
                 Needs to be passed if dataset is used for training.
+            shuffle_options (bool): If True, randomly permute the order of answer
+                choices for each sample.  The correct_answer index and caption_types
+                list are updated accordingly so downstream metrics remain correct.
+                Essential for generative models (e.g. LLaVA) to eliminate position
+                bias; has no effect on CLIP-like embedding models.
+            seed (int): Random seed used for reproducible shuffling.
         """
         self.df = pd.read_csv(csv_file, sep=',')
         self.transforms = transforms
         self.num_answers = num_answers
         self.path = path
         self.tokenizer = tokenizer
+        self.shuffle_options = shuffle_options
+        self.is_synthetic = is_synthetic
+        # Use a per-dataset Random instance so shuffling is independent of the
+        # global numpy/torch RNG, and fully reproducible given the same seed.
+        self._rng = random.Random(seed)
 
     def __len__(self):
         return len(self.df)
@@ -109,14 +126,29 @@ class CsvMCQDataset(Dataset):
         row = self.df.iloc[idx]
         image_path = row[self.path]
         captions = [row[f"caption_{i}"] for i in range(self.num_answers)]
-        correct_answer = row["correct_answer"]
+        correct_answer = int(row["correct_answer"])          # always 0 in CSVs
         correct_answer_template = row["correct_answer_template"]
+
+        # caption_types tracks the semantic role of each caption slot.
+        # Original order depends on whether the dataset is synthetic or not.
+        if self.is_synthetic:
+            caption_types = list(self.SYNTHETIC_CAPTION_TYPES)
+        else:
+            caption_types = list(self.CAPTION_TYPES)
+
+        if self.shuffle_options:
+            perm = list(range(self.num_answers))
+            self._rng.shuffle(perm)
+            captions = [captions[i] for i in perm]
+            caption_types = [caption_types[i] for i in perm]
+            # correct_answer was at position 0 ('gt'); find its new position.
+            correct_answer = perm.index(0)
 
         image = self.transforms(Image.open(image_path))
 
         if self.tokenizer is not None:
             captions = [self.tokenizer([str(caption)])[0] for caption in captions]
-            captions = torch.stack(captions) # (num_answers, max_seq_len)
+            captions = torch.stack(captions)  # (num_answers, max_seq_len)
 
         return (
             image,
@@ -124,7 +156,9 @@ class CsvMCQDataset(Dataset):
             correct_answer,
             correct_answer_template,
             image_path,
+            caption_types,   # list[str] of length num_answers, e.g. ['hybrid','gt','negative','positive']
         )
+
 
 class CsvBinaryMCQDataset(Dataset):
     def __init__(self, csv_file, transforms):
@@ -875,7 +909,7 @@ def get_csv_mcq_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
 
     return DataInfo(dataloader, sampler)
 
-def get_eval_dataset(args, input_filename,preprocess_fn, mode, img_key='positive_filepath', target_key='target'):
+def get_eval_dataset(args, input_filename, preprocess_fn, mode, img_key='positive_filepath', target_key='target', is_synthetic=False):
     if mode == 'classification':
         dataset = CsvCLassDataset(csv_file=input_filename, transforms=preprocess_fn, img_key=img_key, target_key=target_key)
     elif mode == 'retrieval':
@@ -888,8 +922,14 @@ def get_eval_dataset(args, input_filename,preprocess_fn, mode, img_key='positive
         if args.video:
             # TODO: update the csv file to have a more intuitive column name
             dataset = CsvVideoMCQDataset(csv_file=input_filename, transforms=preprocess_fn, video_key='image_path')
-        else:     
-            dataset = CsvMCQDataset(csv_file=input_filename, transforms=preprocess_fn)
+        else:
+            dataset = CsvMCQDataset(
+                csv_file=input_filename,
+                transforms=preprocess_fn,
+                shuffle_options=getattr(args, 'shuffle_mcq_options', False),
+                seed=getattr(args, 'seed', 42),
+                is_synthetic=is_synthetic,
+            )
     elif mode == 'binary_mcq':
         dataset = CsvBinaryMCQDataset(csv_file=input_filename, transforms=preprocess_fn)
     else:
@@ -1051,7 +1091,7 @@ def get_data(args, preprocess_fns, epoch=0, tokenizer=None):
     #     data["coco-zeroshot"] = get_eval_dataset(args, args.coco_zeroshot, preprocess_val, 'classification', img_key='filepath', target_key='targets')
 
     if args.synthetic_mcq:
-        data["synthetic-mcq"] = get_eval_dataset(args, args.synthetic_mcq, preprocess_val, 'mcq', img_key='filepath', target_key='targets')
+        data["synthetic-mcq"] = get_eval_dataset(args, args.synthetic_mcq, preprocess_val, 'mcq', img_key='filepath', target_key='targets', is_synthetic=True)
     
     if args.coco_mcq:
         data["coco-mcq"] = get_eval_dataset(args, args.coco_mcq, preprocess_val, 'mcq', img_key='filepath', target_key='targets')
