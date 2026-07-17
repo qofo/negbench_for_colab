@@ -6,7 +6,7 @@ from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
-
+import numpy as np
 import torch
 
 from .constants import OPENAI_DATASET_MEAN, OPENAI_DATASET_STD
@@ -127,7 +127,15 @@ def get_tokenizer(
 
 
 def load_state_dict(checkpoint_path: str, map_location='cpu'):
-    checkpoint = torch.load(checkpoint_path, map_location=map_location)
+    # option 1. use weights_only=False
+    checkpoint = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
+
+    # option 2. 
+    #torch.serialization.add_safe_globals([np.core.multiarray.scalar])
+    # or
+    #torch.serialization.safe_globals([numpy.core.multiarray.scalar])
+    #checkpoint = torch.load(checkpoint_path, map_location=map_location)
+    
     if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
         state_dict = checkpoint['state_dict']
     elif isinstance(checkpoint, torch.jit.ScriptModule):
