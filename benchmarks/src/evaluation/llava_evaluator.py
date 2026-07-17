@@ -115,6 +115,8 @@ class LLaVAModularEvaluator:
         model_path: str,
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
+        # --- optional quantization (for low VRAM GPUs) ---
+        quantize: Optional[str] = None,          # None | "int4" | "int8"
         # --- optional vision-encoder swap ---
         vision_encoder_path: Optional[str] = None,
         vision_encoder_model: Optional[str] = None,   # e.g. "ViT-B-32"
@@ -147,6 +149,8 @@ class LLaVAModularEvaluator:
         self.dtype = dtype
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
+        # When quantization is active, device placement is handled by device_map="auto"
+        self._use_device_map = quantize is not None
 
         # 1. Load the full LLaVA model via HuggingFace transformers
         # Auto-detects and loads either LLaVA-1.5 or LLaVA-NeXT
@@ -173,14 +177,36 @@ class LLaVAModularEvaluator:
         variant = _detect_llava_variant(model_path)
         logger.info(f"  Detected variant : {variant}")
 
+        # Build quantization config (requires bitsandbytes)
+        model_kwargs = dict(torch_dtype=dtype, low_cpu_mem_usage=True)
+        if quantize is not None:
+            try:
+                from transformers import BitsAndBytesConfig
+            except ImportError as exc:
+                raise ImportError(
+                    "bitsandbytes is required for quantization. "
+                    "Install with: pip install bitsandbytes"
+                ) from exc
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=(quantize == "int4"),
+                load_in_8bit=(quantize == "int8"),
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+            model_kwargs["quantization_config"] = bnb_config
+            # device_map is required when using bitsandbytes quantization
+            model_kwargs["device_map"] = "auto"
+            logger.info(f"  Quantization     : {quantize} (BitsAndBytes)")
+        else:
+            logger.info("  Quantization     : none")
+
         if variant == "llava_next" and _have_llava_next:
             logger.info("  Using LlavaNextForConditionalGeneration")
             self.processor = LlavaNextProcessor.from_pretrained(model_path)
             self._full_model = LlavaNextForConditionalGeneration.from_pretrained(
-                model_path,
-                torch_dtype=dtype,
-                low_cpu_mem_usage=True,
-            ).to(self.device)
+                model_path, **model_kwargs
+            )
         else:
             if variant == "llava_next" and not _have_llava_next:
                 logger.warning(
@@ -191,10 +217,12 @@ class LLaVAModularEvaluator:
             logger.info("  Using LlavaForConditionalGeneration")
             self.processor = LlavaProcessor.from_pretrained(model_path)
             self._full_model = LlavaForConditionalGeneration.from_pretrained(
-                model_path,
-                torch_dtype=dtype,
-                low_cpu_mem_usage=True,
-            ).to(self.device)
+                model_path, **model_kwargs
+            )
+
+        # Move to device only when not using device_map (quantization handles placement)
+        if not self._use_device_map:
+            self._full_model = self._full_model.to(self.device)
 
         self._full_model.eval()
 

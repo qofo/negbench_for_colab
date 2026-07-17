@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+#!/bin/bash
 # run_single_model_evaluations.sh (Unified Version)
 #
 # Use the MODEL_TYPE variable to select either CLIP or LLaVA for evaluation.
@@ -38,6 +38,11 @@ VISION_ENCODER_MODEL=""   # Example: "ViT-B-32"
 VISION_ENCODER_PATH=""    # Example: "$MODELS_DIR/NegCLIP/negclip.pth"
 DTYPE="float16"           # float16 | bfloat16 | float32
 MAX_NEW_TOKENS=16
+# Quantization to reduce VRAM usage (requires: pip install bitsandbytes)
+#   int4  : ~4-5 GB VRAM  (recommended for GPUs with 8-12 GB)
+#   int8  : ~7-8 GB VRAM
+#   ""    : no quantization (requires ~14 GB for LLaVA-1.5-7b in float16)
+QUANTIZE="int4"
 
 # Dataset paths for images
 COCO_MCQ="$DATA_DIR/images/COCO_val_mcq_llama3.1_rephrased.csv"
@@ -104,9 +109,16 @@ elif [ "$MODEL_TYPE" = "llava" ]; then
         LLAVA_MODEL_NAME="${LLAVA_MODEL_NAME}_enc_${VISION_ENCODER_MODEL}"
     fi
 
+    # Configure flag for quantization
+    QUANTIZE_FLAG=""
+    if [ -n "$QUANTIZE" ]; then
+        QUANTIZE_FLAG="--quantize $QUANTIZE"
+    fi
+
     CUDA_VISIBLE_DEVICES=0 python -m src.evaluation.eval_negation_llava \
         --llava-model-path "$LLAVA_MODEL_PATH" \
         $ENCODER_FLAGS \
+        $QUANTIZE_FLAG \
         --name "mcq_${LLAVA_MODEL_NAME}" \
         --logs="$RUN_LOGS_DIR" \
         --coco-mcq="$COCO_MCQ" \

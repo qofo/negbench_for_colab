@@ -84,6 +84,13 @@ def parse_args(args):
         help="Model weight dtype."
     )
     parser.add_argument(
+        "--quantize", type=str, default=None,
+        choices=["int4", "int8"],
+        help="Enable BitsAndBytes quantization to reduce VRAM usage. "
+             "int4 uses ~4-5 GB, int8 uses ~7-8 GB (requires bitsandbytes). "
+             "Recommended for GPUs with less than 16 GB VRAM."
+    )
+    parser.add_argument(
         "--max-new-tokens", type=int, default=16,
         help="Max tokens generated per MCQ answer."
     )
@@ -247,6 +254,7 @@ def main(args):
         model_path=args.llava_model_path,
         device=args.device,
         dtype=dtype,
+        quantize=args.quantize,
         vision_encoder_path=args.vision_encoder_path,
         vision_encoder_model=args.vision_encoder_model,
         max_new_tokens=args.max_new_tokens,
