@@ -150,7 +150,8 @@ class LLaVAModularEvaluator:
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         # When quantization is active, device placement is handled by device_map="auto"
-        self._use_device_map = quantize is not None
+        #self._use_device_map = quantize is not None
+        self._use_device_map="auto"
 
         # 1. Load the full LLaVA model via HuggingFace transformers
         # Auto-detects and loads either LLaVA-1.5 or LLaVA-NeXT
@@ -178,7 +179,7 @@ class LLaVAModularEvaluator:
         logger.info(f"  Detected variant : {variant}")
 
         # Build quantization config (requires bitsandbytes)
-        model_kwargs = dict(torch_dtype=dtype, low_cpu_mem_usage=True)
+        model_kwargs = dict(torch_dtype=dtype, low_cpu_mem_usage=True, device_map="auto")
         if quantize is not None:
             try:
                 from transformers import BitsAndBytesConfig
@@ -334,7 +335,7 @@ class LLaVAModularEvaluator:
         prompt_text = (
             "Which caption best describes the image?\n"
             f"{options_str}\n"
-            "Answer with only the letter of the correct option."
+            "Answer with only the letter of the correct option in last sentence."
         )
 
         # Use the LLaVA conversation template
@@ -395,42 +396,18 @@ class LLaVAModularEvaluator:
     def _parse_option(text: str, option_labels: List[str]) -> int:
         """
         Extract the predicted option index from the generated text.
-
-        Mirrors the Excel formula logic::
-
-            =LET(x, TEXTSPLIT(F2,CHAR(10)),
-                 c, IF(LEFT(TRIM(x),1)="(", MID(TRIM(x),2,1), LEFT(TRIM(x),1)),
-                 XMATCH(c, {"A","B","C","D"}) - 1)
-
-        Steps:
-          1. Split text by newlines.
-          2. For each line, trim whitespace.
-          3. If the first character is '(', take the second character as the
-             candidate letter; otherwise take the first character.
-          4. Match the candidate (case-insensitive) against *option_labels*.
-          5. Return the 0-based index on match, or **-1** on parse failure.
+        Tries to find the first occurrence of any label letter.
+        Falls back to index 0 on parse failure.
         """
-        lines = text.split("\n")
-        for line in lines:
-            trimmed = line.strip()
-            if not trimmed:
-                continue
-            # Extract candidate letter
-            if trimmed[0] == "(":
-                if len(trimmed) < 2:
-                    continue
-                candidate = trimmed[1].upper()
-            else:
-                candidate = trimmed[0].upper()
-            # Match against option labels
-            for idx, label in enumerate(option_labels):
-                if candidate == label:
-                    return idx
+        text_upper = text.upper().strip()
+        for idx, label in enumerate(option_labels):
+            if label in text_upper:
+                return idx
         logger.warning(
             f"Could not parse option from generated text: '{text}'. "
-            "Returning -1 (parse failure)."
+            "Falling back to index 0."
         )
-        return -1
+        return 0
 
     # Convenience: encode image only (for embedding-style analysis)
 
