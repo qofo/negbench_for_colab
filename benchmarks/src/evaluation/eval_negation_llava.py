@@ -180,6 +180,10 @@ def evaluate_llava_on_mcq(
         if is_correct:
             correct_answers_sum += 1
             correct_answers_by_type[question_type] += 1
+        elif predicted_index == -1:
+            # Parse failure — counted as wrong but not attributed to any caption type
+            wrong_answer_counts_by_type["parse_failure"] = \
+                wrong_answer_counts_by_type.get("parse_failure", 0) + 1
         else:
             predicted_type = caption_types[predicted_index]   # semantic type of the chosen option
             wrong_answer_counts_by_type[predicted_type] = \
