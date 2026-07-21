@@ -47,7 +47,8 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 
-from src.evaluation.llava_evaluator import LLaVAModularEvaluator
+from src.llava.llava_evaluator import LLaVAModularEvaluator
+from src.llava.metrics import compute_mcq_metrics
 from training.data import CsvMCQDataset
 
 
@@ -151,15 +152,6 @@ def evaluate_llava_on_mcq(
         seed=seed,
     )
 
-    correct_answers_sum = 0
-    correct_answers_by_type = {"positive": 0, "negative": 0, "hybrid": 0}
-    total_questions_by_type = {"positive": 0, "negative": 0, "hybrid": 0}
-    wrong_answer_counts_by_type = {"hybrid": 0, "positive": 0, "negative": 0}
-    wrong_answers_by_question_type = {
-        "positive": {"positive": 0, "negative": 0, "hybrid": 0},
-        "negative": {"positive": 0, "negative": 0, "hybrid": 0},
-        "hybrid":   {"positive": 0, "negative": 0, "hybrid": 0},
-    }
     sample_results = []
 
     for idx in tqdm(range(len(dataset)), desc=f"Evaluating {dataset_name}"):
@@ -177,21 +169,6 @@ def evaluate_llava_on_mcq(
         predicted_index, raw_text = evaluator.generate_mcq_answer(pil_image, captions)
 
         is_correct = (predicted_index == correct_answer)
-        if is_correct:
-            correct_answers_sum += 1
-            correct_answers_by_type[question_type] += 1
-        elif predicted_index == -1:
-            # Parse failure — counted as wrong but not attributed to any caption type
-            wrong_answer_counts_by_type["parse_failure"] = \
-                wrong_answer_counts_by_type.get("parse_failure", 0) + 1
-        else:
-            predicted_type = caption_types[predicted_index]   # semantic type of the chosen option
-            wrong_answer_counts_by_type[predicted_type] = \
-                wrong_answer_counts_by_type.get(predicted_type, 0) + 1
-            wrong_answers_by_question_type[question_type][predicted_type] = \
-                wrong_answers_by_question_type[question_type].get(predicted_type, 0) + 1
-
-        total_questions_by_type[question_type] += 1
 
         sample_results.append({
             "image_path":       image_path,
@@ -204,26 +181,7 @@ def evaluate_llava_on_mcq(
             **{f"caption_{j}": captions[j] for j in range(len(captions))},
         })
 
-    total = len(dataset)
-    def safe_div(a, b): return a / b if b > 0 else float("nan")
-
-    total_wrong = sum(wrong_answer_counts_by_type.values())
-    metrics = {
-        f"{dataset_name}-total_accuracy":    correct_answers_sum / total,
-        f"{dataset_name}-positive_accuracy": safe_div(correct_answers_by_type["positive"],
-                                                       total_questions_by_type["positive"]),
-        f"{dataset_name}-negative_accuracy": safe_div(correct_answers_by_type["negative"],
-                                                       total_questions_by_type["negative"]),
-        f"{dataset_name}-hybrid_accuracy":   safe_div(correct_answers_by_type["hybrid"],
-                                                       total_questions_by_type["hybrid"]),
-        f"{dataset_name}-wrong_answer_percentages": {
-            k: (v / total_wrong * 100 if total_wrong > 0 else 0.0)
-            for k, v in wrong_answer_counts_by_type.items()
-        },
-        f"{dataset_name}-wrong_answers_by_question_type": wrong_answers_by_question_type,
-        f"{dataset_name}-sample_results": sample_results,
-    }
-    return metrics
+    return compute_mcq_metrics(sample_results, dataset_name=dataset_name)
 
 
 # ---------------------------------------------------------------------------
