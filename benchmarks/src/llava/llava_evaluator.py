@@ -98,6 +98,9 @@ def _load_openclip_vision_encoder(
 
 # Main class
 
+from src.llava.parser import parse_option_robust
+
+
 class LLaVAModularEvaluator:
     """
     Modular LLaVA evaluator with optional vision-encoder hot-swap.
@@ -395,19 +398,9 @@ class LLaVAModularEvaluator:
     @staticmethod
     def _parse_option(text: str, option_labels: List[str]) -> int:
         """
-        Extract the predicted option index from the generated text.
-        Tries to find the first occurrence of any label letter.
-        Falls back to index 0 on parse failure.
+        Extract the predicted option index from the generated text using robust regex parsing.
         """
-        text_upper = text.upper().strip()
-        for idx, label in enumerate(option_labels):
-            if label in text_upper:
-                return idx
-        logger.warning(
-            f"Could not parse option from generated text: '{text}'. "
-            "Falling back to index 0."
-        )
-        return 0
+        return parse_option_robust(text, option_labels)
 
     # Convenience: encode image only (for embedding-style analysis)
 
