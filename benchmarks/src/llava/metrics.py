@@ -29,6 +29,10 @@ def compute_mcq_metrics(sample_results: List[Dict], dataset_name: str = None) ->
     if total_questions == 0:
         return {}
 
+    correct_answers_logit_sum = 0
+    correct_answers_logit_by_type = {"positive": 0, "negative": 0, "hybrid": 0}
+    has_logit_preds = False
+
     for sample in sample_results:
         q_type = sample.get("question_type")
         if not q_type:
@@ -59,6 +63,13 @@ def compute_mcq_metrics(sample_results: List[Dict], dataset_name: str = None) ->
                 wrong_answers_by_question_type[q_type] = {}
             wrong_answers_by_question_type[q_type][predicted_type] = wrong_answers_by_question_type[q_type].get(predicted_type, 0) + 1
 
+        if "predicted_answer_logit" in sample:
+            has_logit_preds = True
+            pred_logit_idx = sample.get("predicted_answer_logit")
+            if pred_logit_idx == corr_idx:
+                correct_answers_logit_sum += 1
+                correct_answers_logit_by_type[q_type] = correct_answers_logit_by_type.get(q_type, 0) + 1
+
     def safe_div(a, b): return a / b if b > 0 else float('nan')
 
     total_wrong = sum(wrong_answer_counts_by_type.values())
@@ -77,12 +88,23 @@ def compute_mcq_metrics(sample_results: List[Dict], dataset_name: str = None) ->
         'positive_accuracy': safe_div(correct_answers_by_type.get('positive', 0), total_questions_by_type.get('positive', 0)),
         'negative_accuracy': safe_div(correct_answers_by_type.get('negative', 0), total_questions_by_type.get('negative', 0)),
         'hybrid_accuracy': safe_div(correct_answers_by_type.get('hybrid', 0), total_questions_by_type.get('hybrid', 0)),
+    }
+
+    if has_logit_preds:
+        metrics.update({
+            'total_accuracy_logit': safe_div(correct_answers_logit_sum, total_questions),
+            'positive_accuracy_logit': safe_div(correct_answers_logit_by_type.get('positive', 0), total_questions_by_type.get('positive', 0)),
+            'negative_accuracy_logit': safe_div(correct_answers_logit_by_type.get('negative', 0), total_questions_by_type.get('negative', 0)),
+            'hybrid_accuracy_logit': safe_div(correct_answers_logit_by_type.get('hybrid', 0), total_questions_by_type.get('hybrid', 0)),
+        })
+
+    metrics.update({
         'most_common_wrong_answer_type': most_common_wrong,
         'wrong_answer_percentages': wrong_answer_percentages,
         'predictions_by_type': predictions_by_type,
         'wrong_answers_by_question_type': wrong_answers_by_question_type,
         'sample_results': sample_results
-    }
+    })
 
     if dataset_name:
         metrics = {f"{dataset_name}-{k}": v for k, v in metrics.items()}

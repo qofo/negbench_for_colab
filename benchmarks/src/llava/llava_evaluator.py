@@ -309,10 +309,10 @@ class LLaVAModularEvaluator:
         image: Image.Image,
         captions: List[str],
         option_labels: Optional[List[str]] = None,
-    ) -> Tuple[int, str]:
+    ) -> Tuple[int, str, Optional[List[float]]]:
         """
         Present the image + MCQ prompt to the LLaVA model and return the
-        predicted answer index.
+        predicted answer index, generated text, and option probabilities.
 
         Args:
             image:
@@ -324,8 +324,9 @@ class LLaVAModularEvaluator:
                 Defaults to ["A", "B", "C", "D"] for N=4.
 
         Returns:
-            (predicted_index, raw_generated_text)
+            (predicted_index, raw_generated_text, option_probs)
             predicted_index is the 0-based index into captions.
+            option_probs is a list of softmax probabilities for each option label.
         """
         n = len(captions)
         if option_labels is None:
@@ -377,12 +378,16 @@ class LLaVAModularEvaluator:
         gen_kwargs = dict(
             max_new_tokens=self.max_new_tokens,
             do_sample=(self.temperature > 0),
+            output_scores=True,
+            return_dict_in_generate=True,
         )
         if self.temperature > 0:
             gen_kwargs["temperature"] = self.temperature
 
         with torch.no_grad():
-            output_ids = self._full_model.generate(**inputs, **gen_kwargs)
+            outputs = self._full_model.generate(**inputs, **gen_kwargs)
+
+        output_ids = outputs.sequences
 
         # Decode only the newly generated tokens
         input_len = inputs["input_ids"].shape[1]
@@ -393,7 +398,23 @@ class LLaVAModularEvaluator:
 
         # Parse the predicted option letter
         predicted_index = self._parse_option(raw_text, option_labels)
-        return predicted_index, raw_text
+
+        # Compute option probabilities from the first generated token's logits
+        option_probs = None
+        if hasattr(outputs, "scores") and len(outputs.scores) > 0:
+            if not hasattr(self, "_option_token_ids"):
+                from src.llava.logits import get_option_token_ids
+                self._option_token_ids = get_option_token_ids(self.processor.tokenizer, option_labels)
+
+            first_logits = outputs.scores[0][0]
+            labels = option_labels[:n]
+            raw_logits = torch.tensor(
+                [first_logits[self._option_token_ids[lbl]].item() for lbl in labels],
+                dtype=torch.float32,
+            )
+            option_probs = F.softmax(raw_logits, dim=0).cpu().numpy().tolist()
+
+        return predicted_index, raw_text, option_probs
 
     @staticmethod
     def _parse_option(text: str, option_labels: List[str]) -> int:

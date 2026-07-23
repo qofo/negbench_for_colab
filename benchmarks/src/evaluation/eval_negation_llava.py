@@ -166,11 +166,11 @@ def evaluate_llava_on_mcq(
         pil_image = Image.open(image_path).convert("RGB")
 
         # Generate answer
-        predicted_index, raw_text = evaluator.generate_mcq_answer(pil_image, captions)
+        predicted_index, raw_text, option_probs = evaluator.generate_mcq_answer(pil_image, captions)
 
         is_correct = (predicted_index == correct_answer)
 
-        sample_results.append({
+        sample_dict = {
             "image_path":       image_path,
             "question_type":    question_type,
             "correct_answer":   correct_answer,
@@ -179,7 +179,15 @@ def evaluate_llava_on_mcq(
             "raw_generated":    raw_text,
             "caption_types":    caption_types,
             **{f"caption_{j}": captions[j] for j in range(len(captions))},
-        })
+        }
+        if option_probs is not None:
+            predicted_index_logit = int(np.argmax(option_probs))
+            sample_dict["predicted_answer_logit"] = predicted_index_logit
+            sample_dict["is_correct_logit"] = (predicted_index_logit == correct_answer)
+            for j, prob in enumerate(option_probs):
+                sample_dict[f"logit_{j}"] = float(prob)
+
+        sample_results.append(sample_dict)
 
     return compute_mcq_metrics(sample_results, dataset_name=dataset_name)
 

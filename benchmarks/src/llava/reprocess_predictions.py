@@ -196,8 +196,13 @@ def main(args):
                 # We need to find which shuffled index corresponds to each original index
                 perm = build_perm(shuffled_captions, orig_captions)
                 # perm[orig_idx] = shuffled_idx
-                for orig_i, s_i in enumerate(perm):
-                    record[f"logit_{orig_i}"] = float(shuffled_probs[s_i])
+                orig_probs = [float(shuffled_probs[s_i]) for s_i in perm]
+                for orig_i, prob in enumerate(orig_probs):
+                    record[f"logit_{orig_i}"] = prob
+                
+                pred_logit_idx = int(np.argmax(orig_probs))
+                record["predicted_answer_logit"] = pred_logit_idx
+                record["is_correct_logit"] = (pred_logit_idx == record["correct_answer"])
             except Exception as exc:
                 logger.warning("Logit extraction failed for %s: %s", image_path, exc)
                 for i in range(n_options):
