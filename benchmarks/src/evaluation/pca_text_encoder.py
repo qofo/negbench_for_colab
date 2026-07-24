@@ -1,14 +1,17 @@
 """
-CLIP Negation Information Degradation Mechanism Analysis Module (Refined 2nd Edition).
+CLIP Negation Information Degradation Mechanism Analysis Module (Refined 3rd Edition).
 
 Stage 1 Experiments (Top Priority):
   1. Pipeline 5-Step Degradation Tracking (Line Plot)
   2. Direction Preservation Analysis (Distance Norm Ratio: Negation vs Random Control)
   3. Linear Probe Analysis (LogisticRegression 5-Fold CV Accuracy: Pre vs Post Projection)
+  4. Representation Geometry & Intrinsic Dimensionality Analysis
+     - Effective Rank (r_eff) & Participation Ratio (PR) Pre vs Post Projection
+     - PCA Variance Spectrum & Anisotropy Analysis
 
 Stage 2 & 3 Experiments:
-  4. Text-side Projection Causal Ablation (Original W_proj vs Identity vs Random Orthogonal)
-  5. Retrieval Metrics & Ranking Flip Rate (Accuracy, MRR, Flip Rate)
+  5. Text-side Projection Causal Ablation (Original W_proj vs Identity vs Random Orthogonal)
+  6. Retrieval Metrics & Ranking Flip Rate (Accuracy, MRR, Flip Rate)
 """
 
 import os
@@ -122,7 +125,7 @@ def extract_pipeline_step_features(
 
 
 # ==============================================================================
-# Experiment 1: Pipeline Step Breakdown (Line Plot)
+# Stage 1-A: Pipeline Step Breakdown (Line Plot)
 # ==============================================================================
 
 def analyze_pipeline_breakdown(
@@ -194,7 +197,7 @@ def analyze_pipeline_breakdown(
 
     ax.plot(x_labels, means, "o-", color="crimson", lw=2.5, ms=8, label="Mean Cosine Sim")
     ax.set_ylabel("Positive↔Negative Cosine Similarity", fontsize=11)
-    ax.set_title("Pipeline Breakdown: Where Does Negation Information Degrade?", fontsize=12, fontweight="bold")
+    ax.set_title("Pipeline Breakdown: Representation Geometry Shift Across Pipeline", fontsize=12, fontweight="bold")
     ax.grid(True, ls="--", alpha=0.5)
     ax.legend(fontsize=10)
     plt.tight_layout()
@@ -233,20 +236,16 @@ def analyze_direction_preservation(
     pos_steps = extract_pipeline_step_features(model, tokenizer, pos_texts, device, batch_size)
     neg_steps = extract_pipeline_step_features(model, tokenizer, neg_texts, device, batch_size)
 
-    # Pre-projection features (Step 2: Layer12 + LN)
     pos_pre = pos_steps["Step2_Layer12_LN"]
     neg_pre = neg_steps["Step2_Layer12_LN"]
 
-    # Post-projection features (Step 4: Final L2 Norm)
     pos_post = pos_steps["Step4_Final_L2Norm"]
     neg_post = neg_steps["Step4_Final_L2Norm"]
 
-    # Euclidean distance pre & post
     dist_pre_neg = np.linalg.norm(pos_pre - neg_pre, axis=1)
     dist_post_neg = np.linalg.norm(pos_post - neg_post, axis=1)
     ratio_neg = dist_post_neg / (dist_pre_neg + 1e-8)
 
-    # Random Control Pairs (permute pos_pre to create random semantic control pairs)
     np.random.seed(42)
     rand_idx = np.random.permutation(len(pos_texts))
     rand_pre = pos_pre[rand_idx]
@@ -256,14 +255,12 @@ def analyze_direction_preservation(
     dist_post_ctrl = np.linalg.norm(pos_post - rand_post, axis=1)
     ratio_ctrl = dist_post_ctrl / (dist_pre_ctrl + 1e-8)
 
-    # T-test comparison of distance ratios
     t_stat, p_val = stats.ttest_ind(ratio_neg, ratio_ctrl)
 
     print(f"Negation Pairs  : Mean Pre Dist={np.mean(dist_pre_neg):.4f} -> Post={np.mean(dist_post_neg):.4f} (Ratio={np.mean(ratio_neg):.4f})")
     print(f"Control Pairs   : Mean Pre Dist={np.mean(dist_pre_ctrl):.4f} -> Post={np.mean(dist_post_ctrl):.4f} (Ratio={np.mean(ratio_ctrl):.4f})")
     print(f"T-test Difference: t={t_stat:.4f}, p-value={p_val:.2e}")
 
-    # Plot Comparison Histogram
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.hist(ratio_neg, bins=35, alpha=0.6, color="crimson", edgecolor="black", label=f"Negation Pairs (Mean Ratio: {np.mean(ratio_neg):.4f})")
     ax.hist(ratio_ctrl, bins=35, alpha=0.6, color="gray", edgecolor="black", label=f"Control Random Pairs (Mean Ratio: {np.mean(ratio_ctrl):.4f})")
@@ -277,7 +274,6 @@ def analyze_direction_preservation(
     plot_path = os.path.join(output_dir, "direction_preservation_analysis.png")
     plt.savefig(plot_path, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"Saved: {plot_path}")
 
     report = {
         "negation_mean_dist_pre": float(np.mean(dist_pre_neg)),
@@ -293,7 +289,6 @@ def analyze_direction_preservation(
     rpt_path = os.path.join(output_dir, "direction_preservation_report.json")
     with open(rpt_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
-    print(f"Saved: {rpt_path}")
 
     return report
 
@@ -322,7 +317,6 @@ def analyze_linear_probe(
     pos_steps = extract_pipeline_step_features(model, tokenizer, pos_texts, device, batch_size)
     neg_steps = extract_pipeline_step_features(model, tokenizer, neg_texts, device, batch_size)
 
-    # Combine positive (label=1) and negative (label=0)
     n_pos = len(pos_texts)
     n_neg = len(neg_texts)
     y = np.array([1] * n_pos + [0] * n_neg)
@@ -345,12 +339,11 @@ def analyze_linear_probe(
         probe_results[slabel] = {"mean_accuracy": mean_acc, "std_accuracy": std_acc}
         print(f"  [{slabel}] Linear Probe 5-Fold Accuracy: {mean_acc:.2f}% (±{std_acc:.2f}%)")
 
-    # Bar Plot
     fig, ax = plt.subplots(figsize=(7, 4.5))
     bars = ax.bar(probe_results.keys(), [v["mean_accuracy"] for v in probe_results.values()],
                   color=["gray", "seagreen", "crimson"], alpha=0.85, edgecolor="black")
     ax.set_ylabel("Linear Probe Accuracy (%)", fontsize=11)
-    ax.set_title("Linear Probe: Can a Classifier Separate Positive vs Negative?", fontsize=11, fontweight="bold")
+    ax.set_title("Linear Probe: Linear Separability Pre vs Post Projection", fontsize=11, fontweight="bold")
     ax.set_ylim(0, 105)
     ax.grid(True, axis="y", ls="--", alpha=0.3)
 
@@ -363,14 +356,112 @@ def analyze_linear_probe(
     plot_path = os.path.join(output_dir, "linear_probe_accuracy.png")
     plt.savefig(plot_path, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"Saved: {plot_path}")
 
     report_path = os.path.join(output_dir, "linear_probe_report.json")
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(probe_results, f, indent=2)
-    print(f"Saved: {report_path}")
 
     return probe_results
+
+
+# ==============================================================================
+# Stage 1-D: Intrinsic Dimensionality & PCA Spectrum (Effective Rank, PR)
+# ==============================================================================
+
+def compute_intrinsic_dimensionality(X: np.ndarray) -> Tuple[float, float]:
+    """
+    Compute Effective Rank (r_eff) and Participation Ratio (PR) of feature matrix X.
+      - Effective Rank: r_eff = exp(-sum p_i ln p_i) where p_i = lambda_i / sum lambda_k
+      - Participation Ratio: PR = (sum lambda_i)^2 / sum(lambda_i^2)
+    """
+    X_centered = X - np.mean(X, axis=0, keepdims=True)
+    cov = (X_centered.T @ X_centered) / X_centered.shape[0]
+    eigenvals = np.linalg.eigvalsh(cov)
+    eigenvals = np.sort(np.maximum(eigenvals, 1e-12))[::-1]  # Sort descending
+
+    # Normalized probabilities p_i
+    total_val = np.sum(eigenvals)
+    p = eigenvals / total_val
+
+    # 1. Effective Rank via Spectral Entropy
+    entropy = -np.sum(p * np.log(p + 1e-12))
+    eff_rank = float(np.exp(entropy))
+
+    # 2. Participation Ratio
+    pr = float((np.sum(eigenvals) ** 2) / np.sum(eigenvals ** 2))
+
+    return eff_rank, pr
+
+
+def analyze_pca_spectrum_compression(
+    model: nn.Module,
+    tokenizer: Any,
+    pos_texts: List[str],
+    neg_texts: List[str],
+    output_dir: str,
+    device: str = "cpu",
+    batch_size: int = 256,
+) -> Dict[str, Any]:
+    """
+    Compare PCA Spectrum & Intrinsic Dimension (Effective Rank & Participation Ratio)
+    Pre-projection (Layer12+LN) vs Post-projection (Final L2Norm).
+    """
+    import pandas as pd
+
+    print("\n" + "="*60)
+    print("Stage 1-D: Intrinsic Dimensionality & PCA Spectrum Analysis")
+    print("="*60)
+
+    pos_steps = extract_pipeline_step_features(model, tokenizer, pos_texts, device, batch_size)
+    neg_steps = extract_pipeline_step_features(model, tokenizer, neg_texts, device, batch_size)
+
+    X_pre = np.vstack([pos_steps["Step2_Layer12_LN"], neg_steps["Step2_Layer12_LN"]])
+    X_post = np.vstack([pos_steps["Step4_Final_L2Norm"], neg_steps["Step4_Final_L2Norm"]])
+
+    # Intrinsic Dimensionality
+    eff_rank_pre, pr_pre = compute_intrinsic_dimensionality(X_pre)
+    eff_rank_post, pr_post = compute_intrinsic_dimensionality(X_post)
+
+    # PCA Variance Spectrum
+    n_comp = min(10, X_pre.shape[1], X_post.shape[1])
+    pca_pre = PCA(n_components=n_comp).fit(X_pre)
+    pca_post = PCA(n_components=n_comp).fit(X_post)
+
+    var_pre = pca_pre.explained_variance_ratio_
+    var_post = pca_post.explained_variance_ratio_
+
+    print(f"Pre-Projection (Layer12+LN) : Effective Rank={eff_rank_pre:.2f}, Participation Ratio={pr_pre:.2f}, PC1={var_pre[0]*100:.2f}%")
+    print(f"Post-Projection (Final L2)  : Effective Rank={eff_rank_post:.2f}, Participation Ratio={pr_post:.2f}, PC1={var_post[0]*100:.2f}%")
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    indices = np.arange(1, n_comp + 1)
+    ax.plot(indices, var_pre * 100, "o-", color="seagreen", lw=2, label=f"Pre-Projection (r_eff={eff_rank_pre:.1f}, PR={pr_pre:.1f})")
+    ax.plot(indices, var_post * 100, "s-", color="crimson", lw=2, label=f"Post-Projection (r_eff={eff_rank_post:.1f}, PR={pr_post:.1f})")
+    ax.set_xlabel("Principal Component Index", fontsize=11)
+    ax.set_ylabel("Explained Variance Ratio (%)", fontsize=11)
+    ax.set_title("Representation Geometry Shift: PCA Variance Spectrum & Intrinsic Dimension", fontsize=11, fontweight="bold")
+    ax.grid(True, ls="--", alpha=0.5)
+    ax.legend(fontsize=10)
+    plt.tight_layout()
+
+    plot_path = os.path.join(output_dir, "pca_spectrum_compression.png")
+    plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    report = {
+        "pre_effective_rank": eff_rank_pre,
+        "pre_participation_ratio": pr_pre,
+        "pre_pc1_var": float(var_pre[0]),
+        "post_effective_rank": eff_rank_post,
+        "post_participation_ratio": pr_post,
+        "post_pc1_var": float(var_post[0]),
+    }
+
+    rpt_path = os.path.join(output_dir, "pca_spectrum_report.json")
+    with open(rpt_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+
+    return report
 
 
 # ==============================================================================
@@ -448,7 +539,6 @@ def analyze_projection_ablation(
     csv_path = os.path.join(output_dir, "projection_causal_ablation.csv")
     df_ablation.to_csv(csv_path, index=False)
 
-    # Bar plot
     fig, ax = plt.subplots(figsize=(8, 5))
     bars = ax.bar(df_ablation["projection_condition"], df_ablation["mean_cosine_sim"], color=["crimson", "seagreen", "dodgerblue"], alpha=0.85, edgecolor="black")
     ax.set_ylabel("Final Cosine Similarity (Lower = Better Negation Separation)", fontsize=10)
@@ -465,7 +555,6 @@ def analyze_projection_ablation(
     plot_path = os.path.join(output_dir, "projection_causal_ablation.png")
     plt.savefig(plot_path, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"Saved: {plot_path}")
 
     return {"csv_path": csv_path, "plot_path": plot_path, "ablation_results": ablation_results}
 
@@ -554,7 +643,6 @@ def analyze_image_text_retrieval_metrics(
 
     pearson_r = float(np.corrcoef(sim_pos_arr, sim_neg_arr)[0, 1])
 
-    # Ranking Flip Rate (when object is IN image, how often is neg_sim > pos_sim?)
     in_img_mask = res_df["object_in_image"] == True
     if np.sum(in_img_mask) > 0:
         flip_rate_in_img = float(np.mean(sim_neg_arr[in_img_mask] > sim_pos_arr[in_img_mask])) * 100
@@ -581,7 +669,6 @@ def analyze_image_text_retrieval_metrics(
     print(f"  Pearson r                 : {pearson_r:.4f}")
     print(f"  Binary MCQ Accuracy       : {accuracy_in_img:.1f}%")
     print(f"  Ranking Flip Rate         : {flip_rate_in_img:.1f}%")
-    print(f"  Mean Sim Diff (Pos - Neg) : {np.mean(sim_diff_arr):.4f}")
 
 
 # ==============================================================================
@@ -591,10 +678,10 @@ def analyze_image_text_retrieval_metrics(
 if __name__ == "__main__":
     import pandas as pd
 
-    parser = argparse.ArgumentParser(description="CLIP Negation Analysis Refined 2nd Edition")
+    parser = argparse.ArgumentParser(description="CLIP Negation Analysis Refined 3rd Edition")
     parser.add_argument("--model", type=str, default="ViT-B-32")
     parser.add_argument("--pretrained", type=str, default="openai")
-    parser.add_argument("--target_token", type=str, default="eot", choices=["eot", "mean", "all"], help="Token representation strategy")
+    parser.add_argument("--target_token", type=str, default="eot", choices=["eot", "mean", "all"])
     parser.add_argument("--csv_path", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="logs/pipeline_breakdown/openai_vit_b32")
     parser.add_argument("--max_samples", type=int, default=60000)
@@ -639,6 +726,9 @@ if __name__ == "__main__":
     # Stage 1-C. Linear Probe Analysis (Linear Separability Pre vs Post)
     analyze_linear_probe(model, tokenizer, pos_texts, neg_texts, args.output_dir, device, args.batch_size)
 
+    # Stage 1-D. Intrinsic Dimensionality & PCA Spectrum (Effective Rank & Participation Ratio)
+    analyze_pca_spectrum_compression(model, tokenizer, pos_texts, neg_texts, args.output_dir, device, args.batch_size)
+
     # Stage 3. Projection Matrix Causal Ablation (Text Space)
     analyze_projection_ablation(model, tokenizer, pos_texts, neg_texts, args.output_dir, device, args.batch_size)
 
@@ -646,4 +736,4 @@ if __name__ == "__main__":
     if args.image_root:
         analyze_image_text_retrieval_metrics(model, tokenizer, preprocess, pair_metadata, pos_texts, neg_texts, args.image_root, args.output_dir, device, args.batch_size)
 
-    print(f"\n✅ Refined 2nd Edition Pipeline Analysis Complete! Results saved in: {args.output_dir}")
+    print(f"\n✅ Refined 3rd Edition Pipeline Analysis Complete! Results saved in: {args.output_dir}")

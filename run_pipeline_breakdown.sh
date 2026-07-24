@@ -1,11 +1,12 @@
 #!/bin/bash
 
 # ==============================================================================
-# Script: run_pipeline_breakdown.sh (Refined 2nd Edition)
-# Experiments (Stage-by-Stage):
+# Script: run_pipeline_breakdown.sh (Refined 3rd Edition)
+# Experiments:
 #   Stage 1-A: Pipeline 5-Step Degradation Line Plot
 #   Stage 1-B: Direction Preservation Analysis (Distance Ratio: Negation vs Control)
 #   Stage 1-C: Linear Probe Analysis (LogisticRegression Acc: Pre vs Post Projection)
+#   Stage 1-D: PCA Variance Spectrum Compression (Pre vs Post Projection Geometry)
 #   Stage 2  : Image-Text Retrieval Metrics (Binary Acc, Flip Rate - if image_root set)
 #   Stage 3  : Text-side Projection Causal Ablation (Original vs Identity vs Orthogonal Q)
 # ==============================================================================
@@ -54,7 +55,8 @@ echo "Analysis Complete! Generated experimental outputs:"
 echo "  [Stage 1-A] ${OUTPUT_DIR}/pipeline_step_lineplot.png"
 echo "  [Stage 1-B] ${OUTPUT_DIR}/direction_preservation_analysis.png"
 echo "  [Stage 1-C] ${OUTPUT_DIR}/linear_probe_accuracy.png        (Linear Separability)"
-echo "  [Stage 1-C] ${OUTPUT_DIR}/linear_probe_report.json"
+echo "  [Stage 1-D] ${OUTPUT_DIR}/pca_spectrum_compression.png      (PCA Variance Spectrum)"
+echo "  [Stage 1-D] ${OUTPUT_DIR}/pca_spectrum_report.json"
 echo "  [Stage 3]   ${OUTPUT_DIR}/projection_causal_ablation.png"
 if [ -n "${IMAGE_ROOT}" ]; then
 echo "  [Stage 2]   ${OUTPUT_DIR}/retrieval_metrics_summary.json"
