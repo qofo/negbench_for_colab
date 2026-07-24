@@ -1,6 +1,6 @@
 """
 LLaVA Modular Evaluator
-=======================
+
 Loads a locally stored LLaVA checkpoint and exposes each sub-module
 separately so that the vision encoder can be replaced with:
   - the original SigLIP/CLIP that shipped with LLaVA
@@ -8,13 +8,13 @@ separately so that the vision encoder can be replaced with:
   - any OpenCLIP-compatible model
 
 Supported LLaVA variants
--------------------------
+
 - LLaVA-1.5  (llava-hf/llava-1.5-*)
 - LLaVA-NeXT (llava-hf/llava-v1.6-*)
 - Any model that follows the `LlavaForConditionalGeneration` HuggingFace API.
 
 Usage
------
+
 See `eval_negation_llava.py` for the full evaluation pipeline, or use
 this class directly:
 
@@ -30,6 +30,7 @@ this class directly:
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -41,9 +42,31 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
+# Auto-detect LLaVA variant (1.5 vs NeXT)
+
+def _detect_llava_variant(model_path: str) -> str:
+    """
+    Reads the model_type field from model_path/config.json
+    and returns the LLaVA variant.
+
+    Returns:
+        "llava_next" for LLaVA-NeXT (llava-v1.6-*)
+        "llava" for LLaVA-1.5 (default, also used if detection fails)
+    """
+    config_file = Path(model_path) / "config.json"
+    if config_file.exists():
+        try:
+            with open(config_file, encoding="utf-8") as f:
+                cfg = json.load(f)
+            model_type = cfg.get("model_type", "")
+            if "llava_next" in model_type:
+                return "llava_next"
+        except Exception:
+            pass
+    return "llava"
+
+
 # Helper: load an OpenCLIP-compatible vision encoder from a checkpoint
-# ---------------------------------------------------------------------------
 
 def _load_openclip_vision_encoder(
     model_name: str,
@@ -73,16 +96,17 @@ def _load_openclip_vision_encoder(
     return model.visual, preprocess_val
 
 
-# ---------------------------------------------------------------------------
 # Main class
-# ---------------------------------------------------------------------------
+
+from src.llava.parser import parse_option_robust
+
 
 class LLaVAModularEvaluator:
     """
     Modular LLaVA evaluator with optional vision-encoder hot-swap.
 
     Architecture breakdown
-    ----------------------
+
     self.vision_tower    : nn.Module  -- encodes images -> patch feature grid
     self.mm_projector    : nn.Module  -- projects vision features -> LLM input space
     self.language_model  : nn.Module  -- causal LLM (Vicuna, Mistral, ...)
@@ -94,6 +118,8 @@ class LLaVAModularEvaluator:
         model_path: str,
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
+        # --- optional quantization (for low VRAM GPUs) ---
+        quantize: Optional[str] = None,          # None | "int4" | "int8"
         # --- optional vision-encoder swap ---
         vision_encoder_path: Optional[str] = None,
         vision_encoder_model: Optional[str] = None,   # e.g. "ViT-B-32"
@@ -126,10 +152,13 @@ class LLaVAModularEvaluator:
         self.dtype = dtype
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
+        # When quantization is active, device placement is handled by device_map="auto"
+        #self._use_device_map = quantize is not None
+        self._use_device_map="auto"
 
-        # ------------------------------------------------------------------
         # 1. Load the full LLaVA model via HuggingFace transformers
-        # ------------------------------------------------------------------
+        # Auto-detects and loads either LLaVA-1.5 or LLaVA-NeXT
+
         logger.info(f"Loading LLaVA from {model_path} ...")
         try:
             from transformers import LlavaForConditionalGeneration, LlavaProcessor
@@ -139,30 +168,87 @@ class LLaVAModularEvaluator:
                 "Install with: pip install transformers>=4.36"
             ) from exc
 
-        self.processor = LlavaProcessor.from_pretrained(model_path)
-        self._full_model = LlavaForConditionalGeneration.from_pretrained(
-            model_path,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-        ).to(self.device)
+        # LLaVA-NeXT support (optional import, falls back to 1.5 if missing)
+        try:
+            from transformers import (
+                LlavaNextForConditionalGeneration,
+                LlavaNextProcessor,
+            )
+            _have_llava_next = True
+        except ImportError:
+            _have_llava_next = False
+
+        variant = _detect_llava_variant(model_path)
+        logger.info(f"  Detected variant : {variant}")
+
+        # Build quantization config (requires bitsandbytes)
+        model_kwargs = dict(torch_dtype=dtype, low_cpu_mem_usage=True, device_map="auto")
+        if quantize is not None:
+            try:
+                from transformers import BitsAndBytesConfig
+            except ImportError as exc:
+                raise ImportError(
+                    "bitsandbytes is required for quantization. "
+                    "Install with: pip install bitsandbytes"
+                ) from exc
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=(quantize == "int4"),
+                load_in_8bit=(quantize == "int8"),
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+            model_kwargs["quantization_config"] = bnb_config
+            # device_map is required when using bitsandbytes quantization
+            model_kwargs["device_map"] = "auto"
+            logger.info(f"  Quantization     : {quantize} (BitsAndBytes)")
+        else:
+            logger.info("  Quantization     : none")
+
+        if variant == "llava_next" and _have_llava_next:
+            logger.info("  Using LlavaNextForConditionalGeneration")
+            self.processor = LlavaNextProcessor.from_pretrained(model_path)
+            self._full_model = LlavaNextForConditionalGeneration.from_pretrained(
+                model_path, **model_kwargs
+            )
+        else:
+            if variant == "llava_next" and not _have_llava_next:
+                logger.warning(
+                    "LlavaNextForConditionalGeneration not found "
+                    "(transformers version might be too old). "
+                    "Falling back to LlavaForConditionalGeneration."
+                )
+            logger.info("  Using LlavaForConditionalGeneration")
+            self.processor = LlavaProcessor.from_pretrained(model_path)
+            self._full_model = LlavaForConditionalGeneration.from_pretrained(
+                model_path, **model_kwargs
+            )
+
+        # Move to device only when not using device_map (quantization handles placement)
+        if not self._use_device_map:
+            self._full_model = self._full_model.to(self.device)
+
         self._full_model.eval()
 
-        # ------------------------------------------------------------------
         # 2. Expose sub-modules as named attributes
-        # ------------------------------------------------------------------
-        self.vision_tower: torch.nn.Module = self._full_model.vision_tower
-        self.mm_projector: torch.nn.Module = self._full_model.multi_modal_projector
-        self.language_model: torch.nn.Module = self._full_model.language_model
-
-        logger.info(
-            f"  vision_tower  : {type(self.vision_tower).__name__}\n"
-            f"  mm_projector  : {type(self.mm_projector).__name__}\n"
-            f"  language_model: {type(self.language_model).__name__}"
+        # Safely accesses attributes since LLaVA-1.5 and NeXT use the same names
+        self.vision_tower: torch.nn.Module = getattr(
+            self._full_model, "vision_tower", None
+        )
+        self.mm_projector: torch.nn.Module = getattr(
+            self._full_model, "multi_modal_projector", None
+        )
+        self.language_model: torch.nn.Module = getattr(
+            self._full_model, "language_model", None
         )
 
-        # ------------------------------------------------------------------
+        logger.info(
+            f"  vision_tower  : {type(self.vision_tower).__name__ if self.vision_tower else 'N/A'}\n"
+            f"  mm_projector  : {type(self.mm_projector).__name__ if self.mm_projector else 'N/A'}\n"
+            f"  language_model: {type(self.language_model).__name__ if self.language_model else 'N/A'}"
+        )
+
         # 3. Optionally swap the vision tower
-        # ------------------------------------------------------------------
         self._external_preprocess = None  # set when swapping encoder
 
         if vision_encoder_path is not None:
@@ -173,9 +259,7 @@ class LLaVAModularEvaluator:
                 )
             self._swap_vision_encoder(vision_encoder_model, vision_encoder_path)
 
-    # ------------------------------------------------------------------
     # Vision encoder hot-swap
-    # ------------------------------------------------------------------
 
     def _swap_vision_encoder(self, model_name: str, pretrained: str) -> None:
         """
@@ -218,19 +302,17 @@ class LLaVAModularEvaluator:
         self._external_preprocess = preprocess
         logger.info("Vision tower swap complete.")
 
-    # ------------------------------------------------------------------
     # MCQ answer generation
-    # ------------------------------------------------------------------
 
     def generate_mcq_answer(
         self,
         image: Image.Image,
         captions: List[str],
         option_labels: Optional[List[str]] = None,
-    ) -> Tuple[int, str]:
+    ) -> Tuple[int, str, Optional[List[float]]]:
         """
         Present the image + MCQ prompt to the LLaVA model and return the
-        predicted answer index.
+        predicted answer index, generated text, and option probabilities.
 
         Args:
             image:
@@ -242,8 +324,9 @@ class LLaVAModularEvaluator:
                 Defaults to ["A", "B", "C", "D"] for N=4.
 
         Returns:
-            (predicted_index, raw_generated_text)
+            (predicted_index, raw_generated_text, option_probs)
             predicted_index is the 0-based index into captions.
+            option_probs is a list of softmax probabilities for each option label.
         """
         n = len(captions)
         if option_labels is None:
@@ -256,7 +339,7 @@ class LLaVAModularEvaluator:
         prompt_text = (
             "Which caption best describes the image?\n"
             f"{options_str}\n"
-            "Answer with only the letter of the correct option."
+            "Answer with only the letter of the correct option in last sentence."
         )
 
         # Use the LLaVA conversation template
@@ -269,9 +352,16 @@ class LLaVAModularEvaluator:
                 ],
             }
         ]
-        text_prompt = self.processor.apply_chat_template(
-            conversation, add_generation_prompt=True
-        )
+        # apply_chat_template was added to ProcessorMixin in transformers >= 4.40
+        # For older versions, it must be called via processor.tokenizer
+        if hasattr(self.processor, "apply_chat_template"):
+            text_prompt = self.processor.apply_chat_template(
+                conversation, add_generation_prompt=True
+            )
+        else:
+            text_prompt = self.processor.tokenizer.apply_chat_template(
+                conversation, add_generation_prompt=True, tokenize=False
+            )
 
         # Tokenize
         inputs = self.processor(
@@ -288,12 +378,16 @@ class LLaVAModularEvaluator:
         gen_kwargs = dict(
             max_new_tokens=self.max_new_tokens,
             do_sample=(self.temperature > 0),
+            output_scores=True,
+            return_dict_in_generate=True,
         )
         if self.temperature > 0:
             gen_kwargs["temperature"] = self.temperature
 
         with torch.no_grad():
-            output_ids = self._full_model.generate(**inputs, **gen_kwargs)
+            outputs = self._full_model.generate(**inputs, **gen_kwargs)
+
+        output_ids = outputs.sequences
 
         # Decode only the newly generated tokens
         input_len = inputs["input_ids"].shape[1]
@@ -304,28 +398,32 @@ class LLaVAModularEvaluator:
 
         # Parse the predicted option letter
         predicted_index = self._parse_option(raw_text, option_labels)
-        return predicted_index, raw_text
+
+        # Compute option probabilities from the first generated token's logits
+        option_probs = None
+        if hasattr(outputs, "scores") and len(outputs.scores) > 0:
+            if not hasattr(self, "_option_token_ids"):
+                from src.llava.logits import get_option_token_ids
+                self._option_token_ids = get_option_token_ids(self.processor.tokenizer, option_labels)
+
+            first_logits = outputs.scores[0][0]
+            labels = option_labels[:n]
+            raw_logits = torch.tensor(
+                [first_logits[self._option_token_ids[lbl]].item() for lbl in labels],
+                dtype=torch.float32,
+            )
+            option_probs = F.softmax(raw_logits, dim=0).cpu().numpy().tolist()
+
+        return predicted_index, raw_text, option_probs
 
     @staticmethod
     def _parse_option(text: str, option_labels: List[str]) -> int:
         """
-        Extract the predicted option index from the generated text.
-        Tries to find the first occurrence of any label letter.
-        Falls back to index 0 on parse failure.
+        Extract the predicted option index from the generated text using robust regex parsing.
         """
-        text_upper = text.upper().strip()
-        for idx, label in enumerate(option_labels):
-            if label in text_upper:
-                return idx
-        logger.warning(
-            f"Could not parse option from generated text: '{text}'. "
-            "Falling back to index 0."
-        )
-        return 0
+        return parse_option_robust(text, option_labels)
 
-    # ------------------------------------------------------------------
     # Convenience: encode image only (for embedding-style analysis)
-    # ------------------------------------------------------------------
 
     def encode_image(self, image_tensor: torch.Tensor) -> torch.Tensor:
         """
@@ -337,7 +435,15 @@ class LLaVAModularEvaluator:
 
         Returns:
             (B, D) L2-normalised feature vectors.
+
+        Raises:
+            RuntimeError: If vision_tower is not found.
         """
+        if self.vision_tower is None:
+            raise RuntimeError(
+                "vision_tower attribute is missing. "
+                "This model might not support encode_image()."
+            )
         with torch.no_grad():
             feats = self.vision_tower(image_tensor)
             # Different vision towers expose features differently

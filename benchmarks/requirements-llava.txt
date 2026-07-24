@@ -1,0 +1,18 @@
+﻿# Additional dependencies for LLaVA evaluation
+# Install these in addition to the base environment (pip install -e . in benchmarks/)
+#
+# Installation:
+#   pip install -r benchmarks/requirements-llava.txt
+
+# HuggingFace model loading (LlavaForConditionalGeneration, LlavaNextForConditionalGeneration)
+transformers>=4.36
+
+# Used for distributed loading of large models (recommended with low_cpu_mem_usage=True)
+accelerate>=0.26
+
+# Quantization for low-VRAM GPUs (enables --quantize int4 / --quantize int8)
+# Required only when using the --quantize flag; not needed for full-precision runs.
+bitsandbytes>=0.41
+
+# Image processing
+Pillow>=9.0
