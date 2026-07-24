@@ -199,40 +199,70 @@ def analyze_and_plot_pca(
 
 
 if __name__ == "__main__":
+    import pandas as pd
+    import csv
+
     parser = argparse.ArgumentParser(description="CLIP Layer-wise PCA Analysis")
     parser.add_argument("--model", type=str, default="ViT-B-32", help="CLIP model architecture")
     parser.add_argument("--pretrained", type=str, default="openai", help="Pretrained weights name/path")
     parser.add_argument("--target_token", type=str, default="eot", choices=["eot", "mean", "all"], help="Token representation strategy")
-    parser.add_argument("--output_dir", type=str, default="pca_results", help="Directory to save plots and reports")
+    parser.add_argument("--csv_path", type=str, default=None, help="Path to MCQ CSV file for evaluation")
+    parser.add_argument("--output_dir", type=str, default="results/pca/coco_val_mcq_top100_uncovered", help="Directory to save plots and reports")
+    parser.add_argument("--max_samples", type=int, default=500, help="Maximum number of caption pairs to sample from CSV")
     args = parser.parse_args()
 
-    # Sample demo texts (Positive vs Negative pairs)
-    sample_positives = [
-        "A photo of a dog in the park",
-        "A person sitting on a red sofa",
-        "A bright sunny day at the beach",
-        "A woman holding a cell phone",
-        "An apple on a wooden table",
-        "A car driving on a highway",
-        "A cup of hot coffee on the desk",
-        "A cat sleeping peacefully on a rug"
-    ]
+    pos_texts = []
+    neg_texts = []
 
-    sample_negatives = [
-        "A photo of a park without any dog",
-        "A person sitting on a sofa, but no red sofa visible",
-        "A beach scene with no bright sun",
-        "A woman standing with no cell phone in sight",
-        "A wooden table with no apple on it",
-        "A highway with no car driving on it",
-        "A desk with no cup of hot coffee",
-        "A rug with no cat sleeping on it"
-    ]
+    if args.csv_path and os.path.exists(args.csv_path):
+        print(f"Loading texts from CSV: {args.csv_path}")
+        df = pd.read_csv(args.csv_path)
+        
+        for _, row in df.iterrows():
+            correct_idx = int(row.get("correct_answer", 0))
+            pos_col = f"caption_{correct_idx}"
+            if pos_col in row and pd.notna(row[pos_col]):
+                pos_texts.append(str(row[pos_col]))
+
+            # Collect distractor/negated captions
+            for c_i in range(4):
+                if c_i != correct_idx:
+                    c_col = f"caption_{c_i}"
+                    if c_col in row and pd.notna(row[c_col]):
+                        neg_texts.append(str(row[c_col]))
+
+            if len(pos_texts) >= args.max_samples:
+                break
+        
+        print(f"Extracted {len(pos_texts)} positive captions and {len(neg_texts)} negative captions from CSV.")
+    else:
+        print("No CSV provided or CSV not found. Using sample demo texts.")
+        pos_texts = [
+            "A photo of a dog in the park",
+            "A person sitting on a red sofa",
+            "A bright sunny day at the beach",
+            "A woman holding a cell phone",
+            "An apple on a wooden table",
+            "A car driving on a highway",
+            "A cup of hot coffee on the desk",
+            "A cat sleeping peacefully on a rug"
+        ]
+
+        neg_texts = [
+            "A photo of a park without any dog",
+            "A person sitting on a sofa, but no red sofa visible",
+            "A beach scene with no bright sun",
+            "A woman standing with no cell phone in sight",
+            "A wooden table with no apple on it",
+            "A highway with no car driving on it",
+            "A desk with no cup of hot coffee",
+            "A rug with no cat sleeping on it"
+        ]
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     analyze_and_plot_pca(
-        pos_texts=sample_positives,
-        neg_texts=sample_negatives,
+        pos_texts=pos_texts,
+        neg_texts=neg_texts,
         model_name=args.model,
         pretrained=args.pretrained,
         target_token=args.target_token,
