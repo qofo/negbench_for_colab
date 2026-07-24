@@ -1,12 +1,14 @@
 """
-CLIP Text Encoder Layer-wise PCA & Cosine Similarity Analysis Module.
+CLIP Negation Information Degradation Mechanism Analysis Module (Refined 2nd Edition).
 
-Supports two modes:
-  1. Unpaired mode (MCQ CSV): Separate positive/negative text lists → PCA only
-  2. Paired mode (Paired CSV): Matched positive/negative pairs → PCA + per-pair cosine similarity
+Stage 1 Experiments (Top Priority):
+  1. Pipeline 5-Step Degradation Tracking (Line Plot)
+  2. Direction Preservation Analysis (Distance Norm Ratio: Negation vs Random Control)
+  3. Linear Probe Analysis (LogisticRegression 5-Fold CV Accuracy: Pre vs Post Projection)
 
-Optionally, if image paths are available and images exist, computes image-text
-cosine similarity correlation analysis (Experiment 3).
+Stage 2 & 3 Experiments:
+  4. Text-side Projection Causal Ablation (Original W_proj vs Identity vs Random Orthogonal)
+  5. Retrieval Metrics & Ranking Flip Rate (Accuracy, MRR, Flip Rate)
 """
 
 import os
@@ -14,8 +16,11 @@ import argparse
 import json
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.decomposition import PCA
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold, cross_val_score
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -26,315 +31,453 @@ import open_clip
 
 
 # ==============================================================================
-# Core: Layer-wise feature extraction
+# Granular 5-Step Pipeline Feature Extraction
 # ==============================================================================
 
-def extract_layer_representations(
-    model,
-    tokenizer,
+def extract_pipeline_step_features(
+    model: nn.Module,
+    tokenizer: Any,
     texts: List[str],
     device: str = "cpu",
-    target_token: str = "eot",
     batch_size: int = 256,
-) -> Tuple[List[np.ndarray], np.ndarray]:
+    custom_projection: Optional[np.ndarray] = None,
+) -> Dict[str, np.ndarray]:
     """
-    Extract layer-wise representations and final projected embeddings.
-
-    Returns:
-        layer_features: List[np.ndarray] of shape (N, D) per layer.
-        final_embeddings: np.ndarray of shape (N, embed_dim) — projected, normalized.
+    Extract features at 5 granular pipeline steps matching exact CLIP execution order:
+      Step 0: 'Embedding' (Token + Positional Embedding EOT)
+      Step 1: 'Layer12_Raw' (Layer 12 output EOT before ln_final)
+      Step 2: 'Layer12_LN' (Layer 12 output EOT after ln_final)
+      Step 3: 'Projected_Unnorm' (after text_projection EOT)
+      Step 4: 'Final_L2Norm' (after L2 normalization)
     """
     model.eval()
     all_tokens = tokenizer(texts).to(device)
 
-    all_layer_features = None
-    all_final_embeddings = []
+    text_tower = getattr(model, 'text', model)
+    token_embedding = text_tower.token_embedding
+    positional_embedding = text_tower.positional_embedding
+    transformer = text_tower.transformer
+    ln_final = text_tower.ln_final
+    text_projection = getattr(text_tower, 'text_projection', None)
+    attn_mask = getattr(text_tower, 'attn_mask', None)
+
+    steps_data = {
+        "Step0_Embedding": [],
+        "Step1_Layer12_Raw": [],
+        "Step2_Layer12_LN": [],
+        "Step3_Projected_Unnorm": [],
+        "Step4_Final_L2Norm": []
+    }
 
     for start in range(0, len(texts), batch_size):
         end = min(start + batch_size, len(texts))
         batch_tokens = all_tokens[start:end]
 
         with torch.no_grad():
-            final_emb, hidden_states = model.encode_text(
-                batch_tokens, normalize=True, return_all_layers=True
-            )
+            cast_dtype = transformer.get_cast_dtype()
+            eot_indices = batch_tokens.argmax(dim=-1).cpu()
+            batch_idx = torch.arange(batch_tokens.shape[0])
 
-        all_final_embeddings.append(final_emb.float().cpu())
+            # Step 0: Token + Positional Embedding
+            x = token_embedding(batch_tokens).to(cast_dtype)
+            seq_len = batch_tokens.shape[1]
+            x = x + positional_embedding[:seq_len].to(cast_dtype)
+            step0 = x[batch_idx, eot_indices].float().cpu()
 
-        if all_layer_features is None:
-            all_layer_features = [[] for _ in range(len(hidden_states))]
+            # Step 1: Layer 12 Raw output (before LN)
+            x_perm = x.permute(1, 0, 2)
+            x_trans = transformer(x_perm, attn_mask=attn_mask)
+            x_trans = x_trans.permute(1, 0, 2)
+            step1 = x_trans[batch_idx, eot_indices].float().cpu()
 
-        for l_idx, hs in enumerate(hidden_states):
-            hs_cpu = hs.float().cpu()
-            if target_token == "eot":
-                eot_indices = batch_tokens.argmax(dim=-1).cpu()
-                batch_indices = torch.arange(hs_cpu.shape[0])
-                feat = hs_cpu[batch_indices, eot_indices]
-            elif target_token == "mean":
-                feat = hs_cpu.mean(dim=1)
-            elif target_token == "all":
-                feat = hs_cpu.reshape(-1, hs_cpu.shape[-1])
+            # Step 2: Layer 12 + LN (after ln_final)
+            x_ln = ln_final(x_trans)
+            step2 = x_ln[batch_idx, eot_indices].float().cpu()
+
+            # Step 3: Projection
+            if custom_projection is not None:
+                if isinstance(custom_projection, str) and custom_projection == "identity":
+                    step3 = step2.clone()
+                else:
+                    W_custom = torch.from_numpy(custom_projection).float().cpu()
+                    step3 = step2 @ W_custom
+            elif text_projection is not None:
+                if isinstance(text_projection, nn.Linear):
+                    step3 = text_projection(x_ln[batch_idx, eot_indices].to(text_projection.weight.dtype)).float().cpu()
+                else:
+                    step3 = (x_ln[batch_idx, eot_indices].to(text_projection.dtype) @ text_projection).float().cpu()
             else:
-                raise ValueError(f"Unknown target_token: {target_token}")
-            all_layer_features[l_idx].append(feat)
+                step3 = step2.clone()
 
-    layer_features = [torch.cat(feats, dim=0).numpy() for feats in all_layer_features]
-    final_embeddings = torch.cat(all_final_embeddings, dim=0).numpy()
+            # Step 4: L2 Normalization
+            step4 = F.normalize(step3, dim=-1).cpu()
 
-    return layer_features, final_embeddings
+            steps_data["Step0_Embedding"].append(step0)
+            steps_data["Step1_Layer12_Raw"].append(step1)
+            steps_data["Step2_Layer12_LN"].append(step2)
+            steps_data["Step3_Projected_Unnorm"].append(step3)
+            steps_data["Step4_Final_L2Norm"].append(step4)
+
+    return {k: torch.cat(v, dim=0).numpy() for k, v in steps_data.items()}
 
 
 # ==============================================================================
-# Experiment 1 & 2-A: PCA analysis (layer-wise)
+# Experiment 1: Pipeline Step Breakdown (Line Plot)
 # ==============================================================================
 
-def analyze_pca(
-    pos_layer_feats: List[np.ndarray],
-    neg_layer_feats: List[np.ndarray],
-    n_pos: int,
-    n_neg: int,
+def analyze_pipeline_breakdown(
+    model: nn.Module,
+    tokenizer: Any,
+    pos_texts: List[str],
+    neg_texts: List[str],
     output_dir: str,
-    target_token: str,
-    model_name: str,
-    pretrained: str,
-) -> List[dict]:
-    """PCA analysis and grid plot."""
-    num_layers = len(pos_layer_feats)
+    device: str = "cpu",
+    batch_size: int = 256,
+) -> Dict[str, Any]:
+    """Track cosine similarity step-by-step using a clean line plot."""
+    import pandas as pd
 
-    cols = min(4, num_layers)
-    rows = (num_layers + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4.5 * rows))
-    if num_layers == 1:
-        axes = np.array([axes])
-    axes = axes.flatten()
+    print("\n" + "="*60)
+    print("Stage 1-A: Pipeline Step-by-Step Breakdown Analysis")
+    print("="*60)
 
-    report = []
-    report.append("=== CLIP Text Encoder Layer-wise PCA Analysis Report ===")
-    report.append(f"Model: {model_name} ({pretrained})")
-    report.append(f"Target Token: {target_token}")
-    report.append(f"Positive: {n_pos}, Negative: {n_neg}")
-    report.append(f"Layers: {num_layers} (Layer 0 = Embedding)\n")
+    pos_steps = extract_pipeline_step_features(model, tokenizer, pos_texts, device, batch_size)
+    neg_steps = extract_pipeline_step_features(model, tokenizer, neg_texts, device, batch_size)
 
-    pca_data = []
+    step_names = [
+        "Step0_Embedding",
+        "Step1_Layer12_Raw",
+        "Step2_Layer12_LN",
+        "Step3_Projected_Unnorm",
+        "Step4_Final_L2Norm"
+    ]
 
-    for l_idx in range(num_layers):
-        pos_f = pos_layer_feats[l_idx]
-        neg_f = neg_layer_feats[l_idx]
-        combined = np.vstack([pos_f, neg_f])
+    labels_map = {
+        "Step0_Embedding": "Step 0: Embedding",
+        "Step1_Layer12_Raw": "Step 1: Layer12 Raw",
+        "Step2_Layer12_LN": "Step 2: Layer12+LN",
+        "Step3_Projected_Unnorm": "Step 3: +Projection",
+        "Step4_Final_L2Norm": "Step 4: +L2 Norm (Final)"
+    }
 
-        pca = PCA(n_components=min(combined.shape[0], combined.shape[1], 2))
-        combined_pca = pca.fit_transform(combined)
-        pos_pca = combined_pca[:n_pos]
-        neg_pca = combined_pca[n_pos:]
+    breakdown_results = []
+    for idx, sname in enumerate(step_names):
+        pos_f = pos_steps[sname]
+        neg_f = neg_steps[sname]
 
-        var_ratio = pca.explained_variance_ratio_
-        total_var = float(np.sum(var_ratio[:2])) if len(var_ratio) >= 2 else float(np.sum(var_ratio))
+        pos_norm = pos_f / (np.linalg.norm(pos_f, axis=1, keepdims=True) + 1e-8)
+        neg_norm = neg_f / (np.linalg.norm(neg_f, axis=1, keepdims=True) + 1e-8)
+        sims = np.sum(pos_norm * neg_norm, axis=1)
 
-        pos_mean_orig = pos_f.mean(axis=0)
-        neg_mean_orig = neg_f.mean(axis=0)
-        cdist = float(np.linalg.norm(pos_mean_orig - neg_mean_orig))
+        mean_sim = float(np.mean(sims))
+        median_sim = float(np.median(sims))
+        std_sim = float(np.std(sims))
 
-        pos_mean_pca = pos_pca.mean(axis=0)
-        neg_mean_pca = neg_pca.mean(axis=0)
-
-        layer_name = "Embedding" if l_idx == 0 else f"Layer {l_idx}"
-        pca_data.append({
-            "layer": layer_name, "explained_var_2d": total_var,
-            "pc1_var": float(var_ratio[0]), "pc2_var": float(var_ratio[1]) if len(var_ratio) > 1 else 0,
-            "centroid_dist": cdist
+        breakdown_results.append({
+            "step_id": idx,
+            "step_key": sname,
+            "step_name": labels_map[sname],
+            "mean_cosine_sim": mean_sim,
+            "median_cosine_sim": median_sim,
+            "std_cosine_sim": std_sim,
         })
-        report.append(f"[{layer_name}] Var: {total_var*100:.1f}% | Centroid Dist: {cdist:.4f}")
+        print(f"  [{labels_map[sname]}] Mean Cosine Sim: {mean_sim:.4f} (Median: {median_sim:.4f})")
 
-        ax = axes[l_idx]
-        ax.scatter(pos_pca[:, 0], pos_pca[:, 1], c="dodgerblue", label="Positive",
-                   alpha=0.7, edgecolors="k", linewidth=0.5, s=40)
-        ax.scatter(neg_pca[:, 0], neg_pca[:, 1], c="crimson", label="Negative",
-                   alpha=0.7, edgecolors="k", linewidth=0.5, marker="^", s=40)
-        ax.scatter(*pos_mean_pca, c="navy", s=120, marker="X", label="Pos Centroid", edgecolors="w")
-        ax.scatter(*neg_mean_pca, c="darkred", s=120, marker="X", label="Neg Centroid", edgecolors="w")
-        ax.set_title(f"{layer_name}\n(Var: {total_var*100:.1f}%)", fontsize=11, fontweight="bold")
-        ax.set_xlabel("PC 1", fontsize=9)
-        ax.set_ylabel("PC 2", fontsize=9)
-        ax.grid(True, ls="--", alpha=0.5)
-        if l_idx == 0:
-            ax.legend(fontsize=8, loc="best")
+    df_breakdown = pd.DataFrame(breakdown_results)
+    csv_path = os.path.join(output_dir, "pipeline_step_breakdown.csv")
+    df_breakdown.to_csv(csv_path, index=False)
 
-    for l_idx in range(num_layers, len(axes)):
-        fig.delaxes(axes[l_idx])
+    # Line Plot
+    fig, ax = plt.subplots(figsize=(9, 5))
+    x_labels = [labels_map[k] for k in step_names]
+    means = df_breakdown["mean_cosine_sim"].values
+
+    ax.plot(x_labels, means, "o-", color="crimson", lw=2.5, ms=8, label="Mean Cosine Sim")
+    ax.set_ylabel("Positive↔Negative Cosine Similarity", fontsize=11)
+    ax.set_title("Pipeline Breakdown: Where Does Negation Information Degrade?", fontsize=12, fontweight="bold")
+    ax.grid(True, ls="--", alpha=0.5)
+    ax.legend(fontsize=10)
+    plt.tight_layout()
+
+    plot_path = os.path.join(output_dir, "pipeline_step_lineplot.png")
+    plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Saved: {plot_path}")
+
+    return {"csv_path": csv_path, "plot_path": plot_path, "step_results": breakdown_results}
+
+
+# ==============================================================================
+# Stage 1-B: Direction Preservation Analysis (Distance Ratio: Negation vs Control)
+# ==============================================================================
+
+def analyze_direction_preservation(
+    model: nn.Module,
+    tokenizer: Any,
+    pos_texts: List[str],
+    neg_texts: List[str],
+    output_dir: str,
+    device: str = "cpu",
+    batch_size: int = 256,
+) -> Dict[str, Any]:
+    """
+    Compare Distance Ratio (||pos - neg||_post / ||pos - neg||_pre) for Negation vs Random Control.
+    """
+    import pandas as pd
+    from scipy import stats
+
+    print("\n" + "="*60)
+    print("Stage 1-B: Direction Preservation Analysis (Negation vs Random Control)")
+    print("="*60)
+
+    pos_steps = extract_pipeline_step_features(model, tokenizer, pos_texts, device, batch_size)
+    neg_steps = extract_pipeline_step_features(model, tokenizer, neg_texts, device, batch_size)
+
+    # Pre-projection features (Step 2: Layer12 + LN)
+    pos_pre = pos_steps["Step2_Layer12_LN"]
+    neg_pre = neg_steps["Step2_Layer12_LN"]
+
+    # Post-projection features (Step 4: Final L2 Norm)
+    pos_post = pos_steps["Step4_Final_L2Norm"]
+    neg_post = neg_steps["Step4_Final_L2Norm"]
+
+    # Euclidean distance pre & post
+    dist_pre_neg = np.linalg.norm(pos_pre - neg_pre, axis=1)
+    dist_post_neg = np.linalg.norm(pos_post - neg_post, axis=1)
+    ratio_neg = dist_post_neg / (dist_pre_neg + 1e-8)
+
+    # Random Control Pairs (permute pos_pre to create random semantic control pairs)
+    np.random.seed(42)
+    rand_idx = np.random.permutation(len(pos_texts))
+    rand_pre = pos_pre[rand_idx]
+    rand_post = pos_post[rand_idx]
+
+    dist_pre_ctrl = np.linalg.norm(pos_pre - rand_pre, axis=1)
+    dist_post_ctrl = np.linalg.norm(pos_post - rand_post, axis=1)
+    ratio_ctrl = dist_post_ctrl / (dist_pre_ctrl + 1e-8)
+
+    # T-test comparison of distance ratios
+    t_stat, p_val = stats.ttest_ind(ratio_neg, ratio_ctrl)
+
+    print(f"Negation Pairs  : Mean Pre Dist={np.mean(dist_pre_neg):.4f} -> Post={np.mean(dist_post_neg):.4f} (Ratio={np.mean(ratio_neg):.4f})")
+    print(f"Control Pairs   : Mean Pre Dist={np.mean(dist_pre_ctrl):.4f} -> Post={np.mean(dist_post_ctrl):.4f} (Ratio={np.mean(ratio_ctrl):.4f})")
+    print(f"T-test Difference: t={t_stat:.4f}, p-value={p_val:.2e}")
+
+    # Plot Comparison Histogram
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.hist(ratio_neg, bins=35, alpha=0.6, color="crimson", edgecolor="black", label=f"Negation Pairs (Mean Ratio: {np.mean(ratio_neg):.4f})")
+    ax.hist(ratio_ctrl, bins=35, alpha=0.6, color="gray", edgecolor="black", label=f"Control Random Pairs (Mean Ratio: {np.mean(ratio_ctrl):.4f})")
+    ax.set_title(f"Direction Preservation: Negation vs Control Pairs (p={p_val:.1e})", fontsize=12, fontweight="bold")
+    ax.set_xlabel("Distance Ratio (Post-Proj Dist / Pre-Proj Dist)", fontsize=11)
+    ax.set_ylabel("Count", fontsize=11)
+    ax.legend(fontsize=10)
+    ax.grid(True, ls="--", alpha=0.3)
+    plt.tight_layout()
+
+    plot_path = os.path.join(output_dir, "direction_preservation_analysis.png")
+    plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Saved: {plot_path}")
+
+    report = {
+        "negation_mean_dist_pre": float(np.mean(dist_pre_neg)),
+        "negation_mean_dist_post": float(np.mean(dist_post_neg)),
+        "negation_mean_ratio": float(np.mean(ratio_neg)),
+        "control_mean_dist_pre": float(np.mean(dist_pre_ctrl)),
+        "control_mean_dist_post": float(np.mean(dist_post_ctrl)),
+        "control_mean_ratio": float(np.mean(ratio_ctrl)),
+        "ttest_t_stat": float(t_stat),
+        "ttest_p_value": float(p_val)
+    }
+
+    rpt_path = os.path.join(output_dir, "direction_preservation_report.json")
+    with open(rpt_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+    print(f"Saved: {rpt_path}")
+
+    return report
+
+
+# ==============================================================================
+# Stage 1-C: Linear Probe Analysis (LogisticRegression Pre vs Post Projection)
+# ==============================================================================
+
+def analyze_linear_probe(
+    model: nn.Module,
+    tokenizer: Any,
+    pos_texts: List[str],
+    neg_texts: List[str],
+    output_dir: str,
+    device: str = "cpu",
+    batch_size: int = 256,
+) -> Dict[str, Any]:
+    """
+    Train a LogisticRegression linear probe on positive (1) vs negative (0) embeddings
+    at Step 2 (Layer12+LN) vs Step 4 (Final L2 Norm) to measure linear separability.
+    """
+    print("\n" + "="*60)
+    print("Stage 1-C: Linear Probe Analysis (Linear Separability Pre vs Post Projection)")
+    print("="*60)
+
+    pos_steps = extract_pipeline_step_features(model, tokenizer, pos_texts, device, batch_size)
+    neg_steps = extract_pipeline_step_features(model, tokenizer, neg_texts, device, batch_size)
+
+    # Combine positive (label=1) and negative (label=0)
+    n_pos = len(pos_texts)
+    n_neg = len(neg_texts)
+    y = np.array([1] * n_pos + [0] * n_neg)
+
+    probe_results = {}
+    step_keys = ["Step0_Embedding", "Step2_Layer12_LN", "Step4_Final_L2Norm"]
+    step_labels = ["Step 0 (Embed)", "Step 2 (Layer12+LN)", "Step 4 (Final L2Norm)"]
+
+    for skey, slabel in zip(step_keys, step_labels):
+        X_pos = pos_steps[skey]
+        X_neg = neg_steps[skey]
+        X = np.vstack([X_pos, X_neg])
+
+        clf = LogisticRegression(max_iter=1000, random_state=42)
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        scores = cross_val_score(clf, X, y, cv=cv, scoring="accuracy")
+
+        mean_acc = float(np.mean(scores)) * 100
+        std_acc = float(np.std(scores)) * 100
+        probe_results[slabel] = {"mean_accuracy": mean_acc, "std_accuracy": std_acc}
+        print(f"  [{slabel}] Linear Probe 5-Fold Accuracy: {mean_acc:.2f}% (±{std_acc:.2f}%)")
+
+    # Bar Plot
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    bars = ax.bar(probe_results.keys(), [v["mean_accuracy"] for v in probe_results.values()],
+                  color=["gray", "seagreen", "crimson"], alpha=0.85, edgecolor="black")
+    ax.set_ylabel("Linear Probe Accuracy (%)", fontsize=11)
+    ax.set_title("Linear Probe: Can a Classifier Separate Positive vs Negative?", fontsize=11, fontweight="bold")
+    ax.set_ylim(0, 105)
+    ax.grid(True, axis="y", ls="--", alpha=0.3)
+
+    for bar in bars:
+        h = bar.get_height()
+        ax.annotate(f"{h:.1f}%", xy=(bar.get_x() + bar.get_width() / 2, h),
+                    xytext=(0, 3), textcoords="offset points", ha='center', va='bottom', fontweight='bold')
 
     plt.tight_layout()
-    path = os.path.join(output_dir, f"pca_grid_{target_token}.png")
-    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plot_path = os.path.join(output_dir, "linear_probe_accuracy.png")
+    plt.savefig(plot_path, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"Saved: {path}")
+    print(f"Saved: {plot_path}")
 
-    rpt_path = os.path.join(output_dir, f"pca_report_{target_token}.txt")
-    with open(rpt_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(report))
-    print(f"Saved: {rpt_path}")
-    print("\n".join(report))
+    report_path = os.path.join(output_dir, "linear_probe_report.json")
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(probe_results, f, indent=2)
+    print(f"Saved: {report_path}")
 
-    return pca_data
+    return probe_results
 
 
 # ==============================================================================
-# Experiment 2-B,C: Paired cosine similarity analysis
+# Stage 3: Text-side Projection Causal Ablation
 # ==============================================================================
 
-def analyze_paired_cosine_similarity(
-    pos_layer_feats: List[np.ndarray],
-    neg_layer_feats: List[np.ndarray],
-    pos_final_emb: np.ndarray,
-    neg_final_emb: np.ndarray,
-    pair_metadata: Optional[List[dict]],
+def analyze_projection_ablation(
+    model: nn.Module,
+    tokenizer: Any,
+    pos_texts: List[str],
+    neg_texts: List[str],
     output_dir: str,
-    target_token: str,
-):
+    device: str = "cpu",
+    batch_size: int = 256,
+) -> Dict[str, Any]:
     """
-    Compute per-pair cosine similarity at each layer and at the final embedding.
-    Requires pos and neg to be aligned (same length, index i is a matched pair).
+    Causal Ablation: Replace W_proj with (1) Original W_proj, (2) Identity Matrix, (3) Random Orthogonal.
+    Evaluated strictly in text representation space.
     """
     import pandas as pd
 
-    n_pairs = pos_final_emb.shape[0]
-    assert neg_final_emb.shape[0] == n_pairs, "Positive and negative must be same length for paired analysis"
-    num_layers = len(pos_layer_feats)
+    print("\n" + "="*60)
+    print("Stage 3: Projection Matrix Causal Ablation (Text Representation Space)")
+    print("="*60)
 
-    # --- 2-B: Layer-wise cosine similarity ---
-    layer_sim_matrix = np.zeros((n_pairs, num_layers))  # (N, L)
-    layer_stats = []
+    text_tower = getattr(model, 'text', model)
+    text_projection = getattr(text_tower, 'text_projection', None)
 
-    for l_idx in range(num_layers):
-        pf = pos_layer_feats[l_idx]  # (N, D)
-        nf = neg_layer_feats[l_idx]
-        # Cosine similarity per pair
-        pf_norm = pf / (np.linalg.norm(pf, axis=1, keepdims=True) + 1e-8)
-        nf_norm = nf / (np.linalg.norm(nf, axis=1, keepdims=True) + 1e-8)
-        sims = np.sum(pf_norm * nf_norm, axis=1)  # (N,)
-        layer_sim_matrix[:, l_idx] = sims
+    if text_projection is None:
+        print("Model does not have a text_projection matrix. Skipping Ablation.")
+        return {}
 
-        layer_name = "Embedding" if l_idx == 0 else f"Layer {l_idx}"
-        layer_stats.append({
-            "layer": layer_name,
-            "mean": float(np.mean(sims)),
-            "median": float(np.median(sims)),
-            "std": float(np.std(sims)),
-            "min": float(np.min(sims)),
-            "max": float(np.max(sims)),
-        })
+    if isinstance(text_projection, nn.Linear):
+        W_orig = text_projection.weight.T.detach().cpu().numpy()
+    else:
+        W_orig = text_projection.detach().cpu().numpy()
 
-    # Final embedding cosine similarity
-    pf_norm = pos_final_emb / (np.linalg.norm(pos_final_emb, axis=1, keepdims=True) + 1e-8)
-    nf_norm = neg_final_emb / (np.linalg.norm(neg_final_emb, axis=1, keepdims=True) + 1e-8)
-    final_sims = np.sum(pf_norm * nf_norm, axis=1)
-    layer_stats.append({
-        "layer": "Final (projected)",
-        "mean": float(np.mean(final_sims)),
-        "median": float(np.median(final_sims)),
-        "std": float(np.std(final_sims)),
-        "min": float(np.min(final_sims)),
-        "max": float(np.max(final_sims)),
-    })
+    D_in, D_out = W_orig.shape
 
-    # Save layer stats CSV
-    stats_df = pd.DataFrame(layer_stats)
-    stats_path = os.path.join(output_dir, f"cosine_similarity_by_layer_{target_token}.csv")
-    stats_df.to_csv(stats_path, index=False)
-    print(f"Saved: {stats_path}")
+    # 1. Original W_proj
+    steps_orig = extract_pipeline_step_features(model, tokenizer, pos_texts, device, batch_size, custom_projection=None)
+    neg_orig = extract_pipeline_step_features(model, tokenizer, neg_texts, device, batch_size, custom_projection=None)
 
-    # Save per-pair similarity CSV
-    pair_cols = {}
-    for l_idx in range(num_layers):
-        layer_name = "Embedding" if l_idx == 0 else f"Layer_{l_idx}"
-        pair_cols[f"sim_{layer_name}"] = layer_sim_matrix[:, l_idx]
-    pair_cols["sim_Final_projected"] = final_sims
+    # 2. Identity Matrix
+    steps_ident = extract_pipeline_step_features(model, tokenizer, pos_texts, device, batch_size, custom_projection="identity")
+    neg_ident = extract_pipeline_step_features(model, tokenizer, neg_texts, device, batch_size, custom_projection="identity")
 
-    if pair_metadata:
-        for key in pair_metadata[0].keys():
-            pair_cols[key] = [m[key] for m in pair_metadata]
+    # 3. Random Orthogonal Matrix
+    np.random.seed(42)
+    Q, _ = np.linalg.qr(np.random.randn(D_in, D_out))
+    steps_orth = extract_pipeline_step_features(model, tokenizer, pos_texts, device, batch_size, custom_projection=Q)
+    neg_orth = extract_pipeline_step_features(model, tokenizer, neg_texts, device, batch_size, custom_projection=Q)
 
-    pairs_df = pd.DataFrame(pair_cols)
-    pairs_path = os.path.join(output_dir, f"cosine_similarity_pairs_{target_token}.csv")
-    pairs_df.to_csv(pairs_path, index=False)
-    print(f"Saved: {pairs_path}")
+    def get_sims(pos_map, neg_map):
+        pos_f = pos_map["Step4_Final_L2Norm"]
+        neg_f = neg_map["Step4_Final_L2Norm"]
+        pos_n = pos_f / (np.linalg.norm(pos_f, axis=1, keepdims=True) + 1e-8)
+        neg_n = neg_f / (np.linalg.norm(neg_f, axis=1, keepdims=True) + 1e-8)
+        return np.sum(pos_n * neg_n, axis=1)
 
-    # --- Plot 1: Layer-wise cosine similarity distribution (box plot) ---
-    fig, ax = plt.subplots(1, 1, figsize=(14, 5))
-    plot_data = []
-    for l_idx in range(num_layers):
-        layer_name = "Emb" if l_idx == 0 else f"L{l_idx}"
-        for s in layer_sim_matrix[:, l_idx]:
-            plot_data.append({"Layer": layer_name, "Cosine Similarity": s})
-    for s in final_sims:
-        plot_data.append({"Layer": "Final", "Cosine Similarity": s})
-    plot_df = pd.DataFrame(plot_data)
-    sns.boxplot(data=plot_df, x="Layer", y="Cosine Similarity", ax=ax, palette="coolwarm", showfliers=False)
-    sns.stripplot(data=plot_df, x="Layer", y="Cosine Similarity", ax=ax,
-                  color="black", alpha=0.15, size=2, jitter=True)
-    ax.set_title("Positive↔Negative Pair Cosine Similarity by Layer", fontsize=13, fontweight="bold")
-    ax.set_ylabel("Cosine Similarity", fontsize=11)
-    ax.axhline(y=1.0, color="gray", ls="--", alpha=0.5, label="Perfect similarity")
+    sims_orig = get_sims(steps_orig, neg_orig)
+    sims_ident = get_sims(steps_ident, neg_ident)
+    sims_orth = get_sims(steps_orth, neg_orth)
+
+    ablation_results = [
+        {"projection_condition": "Original Trained W_proj", "mean_cosine_sim": float(np.mean(sims_orig)), "std_cosine_sim": float(np.std(sims_orig))},
+        {"projection_condition": "Identity Matrix (No Proj)", "mean_cosine_sim": float(np.mean(sims_ident)), "std_cosine_sim": float(np.std(sims_ident))},
+        {"projection_condition": "Random Orthogonal Matrix Q", "mean_cosine_sim": float(np.mean(sims_orth)), "std_cosine_sim": float(np.std(sims_orth))},
+    ]
+
+    for r in ablation_results:
+        print(f"  [{r['projection_condition']}] Mean Cosine Sim: {r['mean_cosine_sim']:.4f}")
+
+    df_ablation = pd.DataFrame(ablation_results)
+    csv_path = os.path.join(output_dir, "projection_causal_ablation.csv")
+    df_ablation.to_csv(csv_path, index=False)
+
+    # Bar plot
+    fig, ax = plt.subplots(figsize=(8, 5))
+    bars = ax.bar(df_ablation["projection_condition"], df_ablation["mean_cosine_sim"], color=["crimson", "seagreen", "dodgerblue"], alpha=0.85, edgecolor="black")
+    ax.set_ylabel("Final Cosine Similarity (Lower = Better Negation Separation)", fontsize=10)
+    ax.set_title("Causal Ablation: How Projection Matrix Choice Affects Text Similarity", fontsize=11, fontweight="bold")
+    ax.set_ylim(0, 1.05)
     ax.grid(True, axis="y", ls="--", alpha=0.3)
+
+    for bar in bars:
+        height = bar.get_height()
+        ax.annotate(f'{height:.4f}', xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 3), textcoords="offset points", ha='center', va='bottom', fontweight='bold')
+
     plt.tight_layout()
-    dist_path = os.path.join(output_dir, f"cosine_similarity_distribution_{target_token}.png")
-    plt.savefig(dist_path, dpi=300, bbox_inches="tight")
+    plot_path = os.path.join(output_dir, "projection_causal_ablation.png")
+    plt.savefig(plot_path, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"Saved: {dist_path}")
+    print(f"Saved: {plot_path}")
 
-    # --- Plot 2: Final embedding cosine similarity histogram ---
-    fig, ax = plt.subplots(1, 1, figsize=(8, 5))
-    ax.hist(final_sims, bins=40, color="steelblue", edgecolor="black", alpha=0.8)
-    ax.axvline(x=np.mean(final_sims), color="red", ls="--", lw=2,
-               label=f"Mean: {np.mean(final_sims):.3f}")
-    ax.axvline(x=np.median(final_sims), color="orange", ls="--", lw=2,
-               label=f"Median: {np.median(final_sims):.3f}")
-    ax.set_title("Final Embedding: Positive↔Negative Cosine Similarity", fontsize=13, fontweight="bold")
-    ax.set_xlabel("Cosine Similarity", fontsize=11)
-    ax.set_ylabel("Count", fontsize=11)
-    ax.legend(fontsize=10)
-    ax.grid(True, axis="y", ls="--", alpha=0.3)
-    plt.tight_layout()
-    hist_path = os.path.join(output_dir, f"cosine_similarity_final_histogram_{target_token}.png")
-    plt.savefig(hist_path, dpi=300, bbox_inches="tight")
-    plt.close()
-    print(f"Saved: {hist_path}")
-
-    # --- Plot 3: Group comparison if object_in_image info available ---
-    if pair_metadata and "object_in_image" in pair_metadata[0]:
-        in_img = np.array([m["object_in_image"] for m in pair_metadata])
-        sims_in = final_sims[in_img == True]
-        sims_out = final_sims[in_img == False]
-
-        fig, ax = plt.subplots(1, 1, figsize=(8, 5))
-        ax.hist(sims_in, bins=30, alpha=0.6, color="dodgerblue", edgecolor="black",
-                label=f"Object IN image (n={len(sims_in)}, mean={np.mean(sims_in):.3f})")
-        ax.hist(sims_out, bins=30, alpha=0.6, color="crimson", edgecolor="black",
-                label=f"Object NOT in image (n={len(sims_out)}, mean={np.mean(sims_out):.3f})")
-        ax.set_title("Final Cosine Sim: Object In Image vs Not", fontsize=13, fontweight="bold")
-        ax.set_xlabel("Cosine Similarity", fontsize=11)
-        ax.set_ylabel("Count", fontsize=11)
-        ax.legend(fontsize=10)
-        ax.grid(True, axis="y", ls="--", alpha=0.3)
-        plt.tight_layout()
-        grp_path = os.path.join(output_dir, f"cosine_similarity_by_group_{target_token}.png")
-        plt.savefig(grp_path, dpi=300, bbox_inches="tight")
-        plt.close()
-        print(f"Saved: {grp_path}")
-
-    # Print summary
-    print("\n=== Cosine Similarity Summary ===")
-    for s in layer_stats:
-        print(f"  [{s['layer']}] mean={s['mean']:.4f}  median={s['median']:.4f}  std={s['std']:.4f}")
+    return {"csv_path": csv_path, "plot_path": plot_path, "ablation_results": ablation_results}
 
 
 # ==============================================================================
-# Experiment 3: Image-Text cosine similarity correlation (requires images)
+# Stage 2: Image-Text Retrieval Metrics & Ranking Flip Rate
 # ==============================================================================
 
-def analyze_image_text_correlation(
-    model,
-    tokenizer,
-    preprocess,
+def analyze_image_text_retrieval_metrics(
+    model: nn.Module,
+    tokenizer: Any,
+    preprocess: Any,
     pair_metadata: List[dict],
     pos_texts: List[str],
     neg_texts: List[str],
@@ -344,18 +487,15 @@ def analyze_image_text_correlation(
     batch_size: int = 64,
 ):
     """
-    Compute cos_sim(image, positive_caption) vs cos_sim(image, negative_caption)
-    and analyze their correlation.
+    Compute Accuracy, MRR, Ranking Flip Rate, and Pearson correlation.
     """
     import pandas as pd
     from PIL import Image
-    from scipy import stats
 
     model.eval()
     results = []
     skipped = 0
 
-    # Group by unique image paths to avoid redundant image encoding
     image_pairs = {}
     for i, meta in enumerate(pair_metadata):
         img_path = os.path.join(image_root, meta["image_path"])
@@ -363,7 +503,7 @@ def analyze_image_text_correlation(
             image_pairs[img_path] = []
         image_pairs[img_path].append(i)
 
-    print(f"Processing {len(image_pairs)} unique images...")
+    print(f"Processing {len(image_pairs)} unique images for Retrieval Metrics...")
     for img_path, indices in image_pairs.items():
         if not os.path.exists(img_path):
             skipped += len(indices)
@@ -371,8 +511,7 @@ def analyze_image_text_correlation(
 
         try:
             image = preprocess(Image.open(img_path).convert("RGB")).unsqueeze(0).to(device)
-        except Exception as e:
-            print(f"  Error loading {img_path}: {e}")
+        except Exception:
             skipped += len(indices)
             continue
 
@@ -401,80 +540,64 @@ def analyze_image_text_correlation(
                 "sim_diff": sim_pos - sim_neg,
             })
 
-    if skipped > 0:
-        print(f"  Skipped {skipped} pairs (missing images)")
-
     if len(results) == 0:
-        print("No valid image-text pairs found. Skipping Experiment 3.")
+        print("No valid images found. Skipping Retrieval Metrics.")
         return
 
     res_df = pd.DataFrame(results)
     res_path = os.path.join(output_dir, "image_text_similarity.csv")
     res_df.to_csv(res_path, index=False)
-    print(f"Saved: {res_path}")
 
     sim_pos_arr = res_df["sim_image_pos"].values
     sim_neg_arr = res_df["sim_image_neg"].values
+    sim_diff_arr = res_df["sim_diff"].values
 
-    pearson_r, pearson_p = stats.pearsonr(sim_pos_arr, sim_neg_arr)
-    spearman_r, spearman_p = stats.spearmanr(sim_pos_arr, sim_neg_arr)
+    pearson_r = float(np.corrcoef(sim_pos_arr, sim_neg_arr)[0, 1])
 
-    # Scatter plot
-    fig, ax = plt.subplots(1, 1, figsize=(8, 7))
-
-    if "object_in_image" in res_df.columns:
-        in_mask = res_df["object_in_image"] == True
-        ax.scatter(sim_pos_arr[in_mask], sim_neg_arr[in_mask],
-                   c="dodgerblue", alpha=0.6, s=30, label="Object IN image", edgecolors="k", linewidth=0.3)
-        ax.scatter(sim_pos_arr[~in_mask], sim_neg_arr[~in_mask],
-                   c="crimson", alpha=0.6, s=30, label="Object NOT in image", marker="^", edgecolors="k", linewidth=0.3)
+    # Ranking Flip Rate (when object is IN image, how often is neg_sim > pos_sim?)
+    in_img_mask = res_df["object_in_image"] == True
+    if np.sum(in_img_mask) > 0:
+        flip_rate_in_img = float(np.mean(sim_neg_arr[in_img_mask] > sim_pos_arr[in_img_mask])) * 100
+        accuracy_in_img = float(np.mean(sim_pos_arr[in_img_mask] > sim_neg_arr[in_img_mask])) * 100
     else:
-        ax.scatter(sim_pos_arr, sim_neg_arr, c="steelblue", alpha=0.6, s=30, edgecolors="k", linewidth=0.3)
+        flip_rate_in_img = 0.0
+        accuracy_in_img = 0.0
 
-    # Diagonal
-    lims = [min(sim_pos_arr.min(), sim_neg_arr.min()) - 0.05,
-            max(sim_pos_arr.max(), sim_neg_arr.max()) + 0.05]
-    ax.plot(lims, lims, "k--", alpha=0.3, label="y=x (perfect correlation)")
+    retrieval_summary = {
+        "total_pairs_evaluated": len(results),
+        "pearson_r": pearson_r,
+        "mean_sim_pos": float(np.mean(sim_pos_arr)),
+        "mean_sim_neg": float(np.mean(sim_neg_arr)),
+        "mean_sim_diff": float(np.mean(sim_diff_arr)),
+        "binary_mcq_accuracy_pct": accuracy_in_img,
+        "ranking_flip_rate_pct": flip_rate_in_img,
+    }
 
-    ax.set_xlabel('cos_sim(image, "There is A")', fontsize=12)
-    ax.set_ylabel('cos_sim(image, "There is no A")', fontsize=12)
-    ax.set_title(f"Image-Text Similarity: Positive vs Negative\n"
-                 f"Pearson r={pearson_r:.3f} (p={pearson_p:.1e}), "
-                 f"Spearman ρ={spearman_r:.3f} (p={spearman_p:.1e})",
-                 fontsize=12, fontweight="bold")
-    ax.legend(fontsize=10)
-    ax.grid(True, ls="--", alpha=0.3)
-    plt.tight_layout()
-    scatter_path = os.path.join(output_dir, "image_text_correlation.png")
-    plt.savefig(scatter_path, dpi=300, bbox_inches="tight")
-    plt.close()
-    print(f"Saved: {scatter_path}")
+    sum_path = os.path.join(output_dir, "retrieval_metrics_summary.json")
+    with open(sum_path, "w", encoding="utf-8") as f:
+        json.dump(retrieval_summary, f, indent=2)
 
-    # Summary
-    print(f"\n=== Image-Text Correlation Summary ===")
-    print(f"  Valid pairs     : {len(results)}")
-    print(f"  Pearson  r      : {pearson_r:.4f} (p={pearson_p:.2e})")
-    print(f"  Spearman ρ      : {spearman_r:.4f} (p={spearman_p:.2e})")
-    print(f"  Mean sim(pos)   : {np.mean(sim_pos_arr):.4f}")
-    print(f"  Mean sim(neg)   : {np.mean(sim_neg_arr):.4f}")
-    print(f"  Mean diff       : {np.mean(sim_pos_arr - sim_neg_arr):.4f}")
+    print("\n=== Retrieval Metrics Summary ===")
+    print(f"  Pearson r                 : {pearson_r:.4f}")
+    print(f"  Binary MCQ Accuracy       : {accuracy_in_img:.1f}%")
+    print(f"  Ranking Flip Rate         : {flip_rate_in_img:.1f}%")
+    print(f"  Mean Sim Diff (Pos - Neg) : {np.mean(sim_diff_arr):.4f}")
 
 
 # ==============================================================================
-# Main
+# Main Execution
 # ==============================================================================
 
 if __name__ == "__main__":
     import pandas as pd
 
-    parser = argparse.ArgumentParser(description="CLIP Negation Analysis: PCA + Cosine Similarity")
+    parser = argparse.ArgumentParser(description="CLIP Negation Analysis Refined 2nd Edition")
     parser.add_argument("--model", type=str, default="ViT-B-32")
     parser.add_argument("--pretrained", type=str, default="openai")
-    parser.add_argument("--target_token", type=str, default="eot", choices=["eot", "mean", "all"])
-    parser.add_argument("--csv_path", type=str, default=None, help="Path to CSV (MCQ or Paired format)")
-    parser.add_argument("--output_dir", type=str, default="logs/pca/default")
-    parser.add_argument("--max_samples", type=int, default=500)
-    parser.add_argument("--image_root", type=str, default="", help="Root path for images (for Experiment 3)")
+    parser.add_argument("--csv_path", type=str, default=None)
+    parser.add_argument("--output_dir", type=str, default="logs/pipeline_breakdown/openai_vit_b32")
+    parser.add_argument("--max_samples", type=int, default=60000)
+    parser.add_argument("--image_root", type=str, default="")
     parser.add_argument("--batch_size", type=int, default=256)
     args = parser.parse_args()
 
@@ -482,103 +605,44 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    # ── Load CSV ──
     pos_texts = []
     neg_texts = []
-    pair_metadata = None
-    is_paired = False
+    pair_metadata = []
 
     if args.csv_path and os.path.exists(args.csv_path):
-        df = pd.read_csv(args.csv_path)
-        print(f"Loaded CSV: {args.csv_path} ({len(df)} rows)")
+        df = pd.read_csv(args.csv_path).head(args.max_samples)
+        pos_texts = df["positive_caption"].astype(str).tolist()
+        neg_texts = df["negative_caption"].astype(str).tolist()
+        for _, row in df.iterrows():
+            meta = {
+                "image_path": str(row.get("image_path", "")),
+                "object_name": str(row.get("object_name", "")),
+                "object_in_image": row.get("object_in_image", None)
+            }
+            if isinstance(meta["object_in_image"], str):
+                meta["object_in_image"] = meta["object_in_image"].strip().lower() == "true"
+            pair_metadata.append(meta)
 
-        # Auto-detect format
-        if "positive_caption" in df.columns and "negative_caption" in df.columns:
-            # ── Paired format ──
-            is_paired = True
-            df = df.head(args.max_samples)
-            pos_texts = df["positive_caption"].astype(str).tolist()
-            neg_texts = df["negative_caption"].astype(str).tolist()
-            pair_metadata = []
-            for _, row in df.iterrows():
-                meta = {"image_path": str(row.get("image_path", "")),
-                        "object_name": str(row.get("object_name", "")),
-                        "object_in_image": row.get("object_in_image", None)}
-                # Handle string booleans from CSV
-                if isinstance(meta["object_in_image"], str):
-                    meta["object_in_image"] = meta["object_in_image"].strip().lower() == "true"
-                pair_metadata.append(meta)
-            print(f"Paired mode: {len(pos_texts)} matched pairs")
-        else:
-            # ── MCQ format ──
-            for _, row in df.iterrows():
-                correct_idx = int(row.get("correct_answer", 0))
-                pos_col = f"caption_{correct_idx}"
-                if pos_col in row and pd.notna(row[pos_col]):
-                    pos_texts.append(str(row[pos_col]))
-                for c_i in range(4):
-                    if c_i != correct_idx:
-                        c_col = f"caption_{c_i}"
-                        if c_col in row and pd.notna(row[c_col]):
-                            neg_texts.append(str(row[c_col]))
-                if len(pos_texts) >= args.max_samples:
-                    break
-            print(f"MCQ mode: {len(pos_texts)} pos, {len(neg_texts)} neg")
-    else:
-        print("No CSV. Using demo texts.")
-        pos_texts = [
-            "A photo of a dog in the park", "A person sitting on a red sofa",
-            "A bright sunny day at the beach", "A woman holding a cell phone",
-        ]
-        neg_texts = [
-            "A photo of a park without any dog", "A person sitting on a sofa, but no red sofa visible",
-            "A beach scene with no bright sun", "A woman standing with no cell phone in sight",
-        ]
-
-    # ── Load model ──
+    # Load model
     print(f"Loading model {args.model} ({args.pretrained})...")
     model, preprocess, _ = open_clip.create_model_and_transforms(args.model, pretrained=args.pretrained)
     tokenizer = open_clip.get_tokenizer(args.model)
     model = model.to(device)
 
-    # ── Extract features ──
-    print(f"Extracting positive text features ({len(pos_texts)} texts)...")
-    pos_layer_feats, pos_final_emb = extract_layer_representations(
-        model, tokenizer, pos_texts, device, args.target_token, args.batch_size)
+    # Stage 1-A. Pipeline 5-Step Breakdown Analysis
+    analyze_pipeline_breakdown(model, tokenizer, pos_texts, neg_texts, args.output_dir, device, args.batch_size)
 
-    print(f"Extracting negative text features ({len(neg_texts)} texts)...")
-    neg_layer_feats, neg_final_emb = extract_layer_representations(
-        model, tokenizer, neg_texts, device, args.target_token, args.batch_size)
+    # Stage 1-B. Direction Preservation Analysis (Distance Ratio)
+    analyze_direction_preservation(model, tokenizer, pos_texts, neg_texts, args.output_dir, device, args.batch_size)
 
-    # ── Experiment 1: PCA ──
-    print("\n" + "="*60)
-    print("Experiment 1: Layer-wise PCA Analysis")
-    print("="*60)
-    pca_data = analyze_pca(
-        pos_layer_feats, neg_layer_feats,
-        len(pos_texts), len(neg_texts),
-        args.output_dir, args.target_token, args.model, args.pretrained)
+    # Stage 1-C. Linear Probe Analysis (Linear Separability Pre vs Post)
+    analyze_linear_probe(model, tokenizer, pos_texts, neg_texts, args.output_dir, device, args.batch_size)
 
-    # ── Experiment 2: Paired Cosine Similarity ──
-    if is_paired:
-        print("\n" + "="*60)
-        print("Experiment 2: Paired Cosine Similarity Analysis")
-        print("="*60)
-        analyze_paired_cosine_similarity(
-            pos_layer_feats, neg_layer_feats,
-            pos_final_emb, neg_final_emb,
-            pair_metadata, args.output_dir, args.target_token)
+    # Stage 3. Projection Matrix Causal Ablation (Text Space)
+    analyze_projection_ablation(model, tokenizer, pos_texts, neg_texts, args.output_dir, device, args.batch_size)
 
-    # ── Experiment 3: Image-Text Correlation (if image_root provided) ──
-    if args.image_root and is_paired:
-        print("\n" + "="*60)
-        print("Experiment 3: Image-Text Cosine Similarity Correlation")
-        print("="*60)
-        analyze_image_text_correlation(
-            model, tokenizer, preprocess, pair_metadata,
-            pos_texts, neg_texts,
-            args.image_root, args.output_dir, device, args.batch_size)
-    elif args.image_root and not is_paired:
-        print("\nSkipping Experiment 3: requires paired CSV format.")
+    # Stage 2. Retrieval Metrics (if image_root provided)
+    if args.image_root:
+        analyze_image_text_retrieval_metrics(model, tokenizer, preprocess, pair_metadata, pos_texts, neg_texts, args.image_root, args.output_dir, device, args.batch_size)
 
-    print("\n✅ All experiments complete. Results in:", args.output_dir)
+    print(f"\n✅ Refined 2nd Edition Pipeline Analysis Complete! Results saved in: {args.output_dir}")
