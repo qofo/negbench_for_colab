@@ -315,13 +315,18 @@ class Transformer(nn.Module):
             return self.resblocks[0].mlp.c_fc.int8_original_dtype
         return self.resblocks[0].mlp.c_fc.weight.dtype
 
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None, return_all_layers: bool = False):
+        intermediate_outputs = []
         for r in self.resblocks:
             if self.grad_checkpointing and not torch.jit.is_scripting():
                 # TODO: handle kwargs https://github.com/pytorch/pytorch/issues/79887#issuecomment-1161758372
                 x = checkpoint(r, x, None, None, attn_mask)
             else:
                 x = r(x, attn_mask=attn_mask)
+            if return_all_layers:
+                intermediate_outputs.append(x)
+        if return_all_layers:
+            return x, intermediate_outputs
         return x
 
 
@@ -669,7 +674,7 @@ class TextTransformer(nn.Module):
         additive_mask = torch.repeat_interleave(additive_mask, self.heads, 0)
         return additive_mask
 
-    def forward(self, text):
+    def forward(self, text, return_all_layers: bool = False):
         cast_dtype = self.transformer.get_cast_dtype()
         seq_len = text.shape[1]
 
@@ -683,8 +688,18 @@ class TextTransformer(nn.Module):
                 attn_mask = attn_mask[None, :seq_len, :seq_len] + cls_mask[:, :seq_len, :seq_len]
 
         x = x + self.positional_embedding[:seq_len].to(cast_dtype)
+        
+        all_hidden_states = []
+        if return_all_layers:
+            all_hidden_states.append(x)  # Embedding layer output [batch_size, seq_len, d_model]
+
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x, attn_mask=attn_mask)
+        if return_all_layers:
+            x, intermediate = self.transformer(x, attn_mask=attn_mask, return_all_layers=True)
+            for inter_x in intermediate:
+                all_hidden_states.append(inter_x.permute(1, 0, 2))
+        else:
+            x = self.transformer(x, attn_mask=attn_mask)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
         # x.shape = [batch_size, n_ctx, transformer.width]
@@ -698,14 +713,21 @@ class TextTransformer(nn.Module):
 
         if self.text_projection is not None:
             if isinstance(self.text_projection, nn.Linear):
-                pooled = self.text_projection(pooled)
+                proj_pooled = self.text_projection(pooled)
             else:
-                pooled = pooled @ self.text_projection
+                proj_pooled = pooled @ self.text_projection
+        else:
+            proj_pooled = pooled
+
+        if return_all_layers:
+            if self.output_tokens:
+                return proj_pooled, tokens, all_hidden_states
+            return proj_pooled, all_hidden_states
 
         if self.output_tokens:
-            return pooled, tokens
+            return proj_pooled, tokens
 
-        return pooled
+        return proj_pooled
 
 
 class MultimodalTransformer(Transformer):

@@ -266,14 +266,24 @@ class CLIP(nn.Module):
         features = self.visual(image)
         return F.normalize(features, dim=-1) if normalize else features
 
-    def encode_text(self, text, normalize: bool = False):
+    def encode_text(self, text, normalize: bool = False, return_all_layers: bool = False):
         cast_dtype = self.transformer.get_cast_dtype()
 
         x = self.token_embedding(text).to(cast_dtype)  # [batch_size, n_ctx, d_model]
 
         x = x + self.positional_embedding.to(cast_dtype)
+        
+        all_hidden_states = []
+        if return_all_layers:
+            all_hidden_states.append(x)  # Embedding layer
+
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x, attn_mask=self.attn_mask)
+        if return_all_layers:
+            x, intermediate = self.transformer(x, attn_mask=self.attn_mask, return_all_layers=True)
+            for inter_x in intermediate:
+                all_hidden_states.append(inter_x.permute(1, 0, 2))
+        else:
+            x = self.transformer(x, attn_mask=self.attn_mask)
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x)  # [batch_size, n_ctx, transformer.width]
         x, _ = text_global_pool(x, text, self.text_pool_type)
@@ -283,7 +293,10 @@ class CLIP(nn.Module):
             else:
                 x = x @ self.text_projection
 
-        return F.normalize(x, dim=-1) if normalize else x
+        x_out = F.normalize(x, dim=-1) if normalize else x
+        if return_all_layers:
+            return x_out, all_hidden_states
+        return x_out
 
     def get_logits(self, image, text):
         image_features = self.encode_image(image, normalize=True)
@@ -359,7 +372,11 @@ class CustomTextCLIP(nn.Module):
         features = self.visual(image)
         return F.normalize(features, dim=-1) if normalize else features
 
-    def encode_text(self, text, normalize: bool = False):
+    def encode_text(self, text, normalize: bool = False, return_all_layers: bool = False):
+        if return_all_layers:
+            features, all_hidden_states = self.text(text, return_all_layers=True)
+            norm_features = F.normalize(features, dim=-1) if normalize else features
+            return norm_features, all_hidden_states
         features = self.text(text)
         return F.normalize(features, dim=-1) if normalize else features
 
