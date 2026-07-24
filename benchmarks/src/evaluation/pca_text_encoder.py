@@ -594,6 +594,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CLIP Negation Analysis Refined 2nd Edition")
     parser.add_argument("--model", type=str, default="ViT-B-32")
     parser.add_argument("--pretrained", type=str, default="openai")
+    parser.add_argument("--target_token", type=str, default="eot", choices=["eot", "mean", "all"], help="Token representation strategy")
     parser.add_argument("--csv_path", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="logs/pipeline_breakdown/openai_vit_b32")
     parser.add_argument("--max_samples", type=int, default=60000)
